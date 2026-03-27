@@ -90,7 +90,7 @@ if (!isWindows) {
 // Step 4: Inject SEA blob
 console.log('[4/5] Injecting SEA blob into binary...');
 const blobPath = resolve(distDir, 'universal-bi-sidecar.blob');
-const sentinel = 'NODE_SEA_BLOB_node:sea';
+const sentinel = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
 
 // postject args differ by platform
 const machoFlag = process.platform === 'darwin' ? '--macho-segment-name NODE_SEA' : '';
