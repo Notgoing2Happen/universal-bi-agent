@@ -92,7 +92,7 @@ jobs:
             target: aarch64-apple-darwin
             bundles: dmg
           - name: Linux x64
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bundles: deb,appimage
 
@@ -138,6 +138,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install
+
+      - name: Build agent-core
+        run: pnpm --filter @universal-bi/agent-core build
 
       # Build the sidecar as a standalone binary (Node SEA)
       - name: Build sidecar binary

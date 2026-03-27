@@ -16,7 +16,7 @@
  */
 
 import { execSync } from 'child_process';
-import { copyFileSync, mkdirSync, existsSync, chmodSync } from 'fs';
+import { copyFileSync, mkdirSync, existsSync, chmodSync, statSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -119,7 +119,7 @@ if (!stat) {
   process.exit(1);
 }
 
-const size = (require('fs').statSync(outputPath).size / 1024 / 1024).toFixed(1);
+const size = (statSync(outputPath).size / 1024 / 1024).toFixed(1);
 console.log(`\nSidecar binary built successfully!`);
 console.log(`  Path:   ${outputPath}`);
 console.log(`  Target: ${targetTriple}`);
