@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dist-sidecar/
+target/
+*.blob
+.DS_Store
+.env
+.env.local

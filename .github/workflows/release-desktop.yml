@@ -1,0 +1,174 @@
+# ===========================================
+# Desktop App Release - Cross-Platform Builds
+# ===========================================
+# Builds Tauri desktop app for Windows, macOS, and Linux.
+# Triggered by:
+#   - Pushing a tag like v0.1.0
+#   - Manual workflow dispatch
+#
+# Creates a GitHub Release with all platform binaries.
+
+name: Release Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '8'
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create_release.outputs.id }}
+      tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: Get tag
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          name: Universal BI Agent ${{ steps.get_tag.outputs.tag }}
+          body: |
+            ## Universal BI Agent ${{ steps.get_tag.outputs.tag }}
+
+            Download the desktop agent for your platform:
+
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | **Windows** | `.msi` or `-setup.exe` | Windows 10+ |
+            | **macOS (Intel)** | `.dmg` | macOS 12+ |
+            | **macOS (Apple Silicon)** | `.dmg` | macOS 12+ (M1/M2/M3) |
+            | **Linux** | `.AppImage` or `.deb` | Ubuntu 20.04+ / Fedora 36+ |
+
+            ### What's New
+            - Desktop agent for local file sync and data bridging
+            - Real-time folder watching with automatic sync
+            - AI-powered column mapping
+            - System tray with sync notifications
+          draft: false
+          prerelease: false
+
+  build-tauri:
+    name: Build ${{ matrix.platform.name }}
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          - name: macOS Intel
+            runner: macos-13
+            target: x86_64-apple-darwin
+            bundles: dmg
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - name: Linux x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+
+    runs-on: ${{ matrix.platform.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+
+      # Linux dependencies
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build the sidecar as a standalone binary (Node SEA)
+      - name: Build sidecar binary
+        working-directory: apps/desktop
+        run: node sidecar/build-binary.mjs --target ${{ matrix.platform.target }}
+
+      # Build Tauri app
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: npx tauri
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target ${{ matrix.platform.target }} --bundles ${{ matrix.platform.bundles }}
+
+  # Update release once all builds complete
+  finalize-release:
+    name: Finalize Release
+    needs: [create-release, build-tauri]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark release as latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: false
+          prerelease: false
+          make_latest: true
