@@ -23,7 +23,7 @@ on:
 
 env:
   NODE_VERSION: '20'
-  PNPM_VERSION: '8'
+  PNPM_VERSION: '10'
 
 jobs:
   create-release:
@@ -137,7 +137,7 @@ jobs:
             libayatana-appindicator3-dev
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
 
       # Build the sidecar as a standalone binary (Node SEA)
       - name: Build sidecar binary

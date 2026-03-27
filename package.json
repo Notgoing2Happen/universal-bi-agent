@@ -2,6 +2,7 @@
   "name": "universal-bi-agent",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@10.28.2",
   "description": "Universal BI Desktop Agent - Local file sync and data bridge",
   "scripts": {
     "build": "pnpm -r build"
