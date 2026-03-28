@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicoviii/tauri-v2-schema/main/schemas/capability.json",
+  "identifier": "default",
+  "description": "Default capabilities for the Universal BI Agent",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "shell:allow-execute",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "notification:default"
+  ]
+}

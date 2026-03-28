@@ -3,6 +3,9 @@ dist/
 dist-sidecar/
 target/
 *.blob
+*.exe
+*.tsbuildinfo
+src-tauri/binaries/
 .DS_Store
 .env
 .env.local
