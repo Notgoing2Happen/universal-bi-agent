@@ -9,21 +9,8 @@
  * so the Vite dev server (browser) can communicate without Tauri.
  */
 
-import { createRequire } from 'module';
 import { WebSocketServer } from 'ws';
-
-// Use require() for CommonJS agent-core
-const require = createRequire(import.meta.url);
-
-let agentCore;
-try {
-  agentCore = require('@universal-bi/agent-core');
-} catch {
-  // Fallback to direct path in dev
-  agentCore = require('../../packages/agent-core/dist/index.js');
-}
-
-const {
+import {
   startIpcServer,
   registerHandler,
   getHandler,
@@ -43,7 +30,7 @@ const {
   uploadFile,
   getCachedConcepts,
   cacheConcepts,
-} = agentCore;
+} from '@universal-bi/agent-core';
 
 // Wire up watcher events to IPC so they reach the Tauri UI
 setWatcherEventCallback((event, data) => {
