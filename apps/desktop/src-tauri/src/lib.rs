@@ -106,11 +106,13 @@ pub fn run() {
             eprintln!("[Tauri] Starting sidecar: {:?}", sidecar_path);
 
             // Spawn sidecar with stdio pipes for JSON-RPC
+            // Use Stdio::null() for stderr to suppress Node.js SEA warnings
+            // that would otherwise appear as popup dialogs on Windows
             match Command::new(&sidecar_path)
                 .env("NODE_ENV", "production")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::null())
                 .spawn()
             {
                 Ok(child) => {
