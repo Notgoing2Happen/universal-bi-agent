@@ -3,30 +3,28 @@ import { useState, useEffect, useCallback } from 'react';
 /**
  * JSON-RPC 2.0 client for communicating with the Node.js sidecar process.
  *
- * In development, connects to a local sidecar via WebSocket on port 9321.
- * In production (Tauri), communicates via shell sidecar stdio.
+ * In production (Tauri), communicates via Tauri invoke → Rust → stdio to sidecar.
+ * In development, connects via WebSocket on port 9321.
  */
-
-interface JsonRpcRequest {
-  jsonrpc: '2.0';
-  id: number;
-  method: string;
-  params?: Record<string, unknown>;
-}
 
 type EventHandler = (params: Record<string, unknown>) => void;
 
 let nextId = 1;
+const eventHandlers = new Map<string, Set<EventHandler>>();
+
+// Detect if running inside Tauri
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+// ─── WebSocket transport (dev mode) ────────────────────────────────
+
 const pendingRequests = new Map<number, {
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
 }>();
-const eventHandlers = new Map<string, Set<EventHandler>>();
 
-let sidecarReady = false;
 let ws: WebSocket | null = null;
 
-function handleMessage(data: string) {
+function handleWsMessage(data: string) {
   try {
     const msg = JSON.parse(data);
     if ('id' in msg && pendingRequests.has(msg.id)) {
@@ -38,7 +36,6 @@ function handleMessage(data: string) {
         resolve(msg.result);
       }
     } else if ('method' in msg && !('id' in msg)) {
-      // Notification/event
       const handlers = eventHandlers.get(msg.method);
       if (handlers) {
         handlers.forEach(h => h(msg.params ?? {}));
@@ -57,12 +54,10 @@ function connectWebSocket(): Promise<void> {
     }
     ws = new WebSocket('ws://localhost:9321');
     ws.onopen = () => {
-      sidecarReady = true;
       resolve();
     };
-    ws.onmessage = (event) => handleMessage(event.data);
+    ws.onmessage = (event) => handleWsMessage(event.data);
     ws.onclose = () => {
-      sidecarReady = false;
       ws = null;
     };
     ws.onerror = () => {
@@ -71,13 +66,13 @@ function connectWebSocket(): Promise<void> {
   });
 }
 
-async function callSidecar(method: string, params?: Record<string, unknown>): Promise<unknown> {
+async function callViaWebSocket(method: string, params?: Record<string, unknown>): Promise<unknown> {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     await connectWebSocket();
   }
 
   const id = nextId++;
-  const request: JsonRpcRequest = {
+  const request = {
     jsonrpc: '2.0',
     id,
     method,
@@ -88,7 +83,6 @@ async function callSidecar(method: string, params?: Record<string, unknown>): Pr
     pendingRequests.set(id, { resolve, reject });
     ws!.send(JSON.stringify(request));
 
-    // Timeout after 30 seconds
     setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
@@ -98,20 +92,58 @@ async function callSidecar(method: string, params?: Record<string, unknown>): Pr
   });
 }
 
+// ─── Tauri invoke transport (production) ───────────────────────────
+
+async function callViaTauri(method: string, params?: Record<string, unknown>): Promise<unknown> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  const id = nextId++;
+  return invoke('sidecar_rpc', {
+    method,
+    params: params ?? {},
+    id,
+  });
+}
+
+// ─── Unified call function ─────────────────────────────────────────
+
+async function callSidecar(method: string, params?: Record<string, unknown>): Promise<unknown> {
+  if (isTauri) {
+    return callViaTauri(method, params);
+  }
+  return callViaWebSocket(method, params);
+}
+
+// ─── React hook ────────────────────────────────────────────────────
+
 export function useSidecar() {
-  const [connected, setConnected] = useState(sidecarReady);
+  const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    connectWebSocket()
-      .then(() => {
-        setConnected(true);
-        setError(null);
-      })
-      .catch(err => {
-        setConnected(false);
-        setError(err.message);
-      });
+    if (isTauri) {
+      // In Tauri, try a ping call to verify sidecar is running
+      callViaTauri('config.get', {})
+        .then(() => {
+          setConnected(true);
+          setError(null);
+        })
+        .catch((err) => {
+          // Sidecar may not be running, but app should still render
+          setConnected(false);
+          setError(err instanceof Error ? err.message : String(err));
+        });
+    } else {
+      // Dev mode: connect via WebSocket
+      connectWebSocket()
+        .then(() => {
+          setConnected(true);
+          setError(null);
+        })
+        .catch(err => {
+          setConnected(false);
+          setError(err.message);
+        });
+    }
   }, []);
 
   const call = useCallback(async <T = unknown>(
