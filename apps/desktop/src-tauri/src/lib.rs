@@ -3,6 +3,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use tauri::Manager;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 struct SidecarState {
     child: Option<Child>,
 }
@@ -106,14 +109,18 @@ pub fn run() {
             eprintln!("[Tauri] Starting sidecar: {:?}", sidecar_path);
 
             // Spawn sidecar with stdio pipes for JSON-RPC
-            // Use Stdio::null() for stderr to suppress Node.js SEA warnings
-            // that would otherwise appear as popup dialogs on Windows
-            match Command::new(&sidecar_path)
-                .env("NODE_ENV", "production")
+            let mut cmd = Command::new(&sidecar_path);
+            cmd.env("NODE_ENV", "production")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
+                .stderr(Stdio::null());
+
+            // On Windows, prevent the sidecar from opening a visible console window.
+            // CREATE_NO_WINDOW = 0x08000000
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(0x08000000);
+
+            match cmd.spawn()
             {
                 Ok(child) => {
                     eprintln!("[Tauri] Sidecar started (pid: {})", child.id());
