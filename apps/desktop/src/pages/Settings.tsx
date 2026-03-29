@@ -21,7 +21,7 @@ export default function Settings() {
 
   useEffect(() => {
     if (!connected) return;
-    call<Config>('config.get').then(setConfig).catch(() => {});
+    call<Config>('config.get').then(c => { if (c) setConfig(c); }).catch(() => {});
   }, [connected, call]);
 
   async function handleSave() {

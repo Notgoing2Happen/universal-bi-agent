@@ -16,7 +16,7 @@ export default function FolderManager() {
 
   useEffect(() => {
     if (!connected) return;
-    call<WatchFolder[]>('folders.list').then(setFolders).catch(() => {});
+    call<WatchFolder[]>('folders.list').then(f => setFolders(f || [])).catch(() => {});
   }, [connected, call]);
 
   async function handleAddFolder() {
@@ -44,7 +44,7 @@ export default function FolderManager() {
         recursive: true,
       });
       const updated = await call<WatchFolder[]>('folders.list');
-      setFolders(updated);
+      setFolders(updated || []);
     } catch (err) {
       console.error('Failed to add folder:', err);
     }
@@ -77,7 +77,7 @@ export default function FolderManager() {
   async function handleRemove(path: string) {
     await call('folders.remove', { path });
     const updated = await call<WatchFolder[]>('folders.list');
-    setFolders(updated);
+    setFolders(updated || []);
   }
 
   async function handleFilesDropped(files: FileEntry[]) {
@@ -172,7 +172,7 @@ export default function FolderManager() {
                   {f.path}
                 </div>
                 <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
-                  {f.extensions.join(', ')} {f.recursive ? '· Recursive' : ''}
+                  {(f.extensions || []).join(', ')} {f.recursive ? '· Recursive' : ''}
                 </div>
               </div>
               <button

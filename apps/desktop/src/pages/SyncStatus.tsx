@@ -24,7 +24,9 @@ export default function SyncStatus() {
 
   const refresh = useCallback(() => {
     if (!connected) return;
-    call<SyncStatusData>('sync.status').then(setStatus).catch(() => {});
+    call<SyncStatusData>('sync.status').then(s => {
+      if (s) setStatus({ ...s, files: s.files || [] });
+    }).catch(() => {});
   }, [connected, call]);
 
   useEffect(() => {
@@ -217,14 +219,14 @@ export default function SyncStatus() {
             </tr>
           </thead>
           <tbody>
-            {status?.files.length === 0 && (
+            {(!status?.files || status.files.length === 0) && (
               <tr>
                 <td colSpan={4} style={{ padding: 24, textAlign: 'center', color: '#64748b' }}>
                   No files tracked yet. Add a watch folder to get started.
                 </td>
               </tr>
             )}
-            {status?.files.map(f => (
+            {(status?.files || []).map(f => (
               <tr key={f.path} style={{ borderBottom: '1px solid #1e293b' }}>
                 <td style={{ padding: '8px 12px', color: '#e2e8f0' }}>
                   {f.path.split(/[/\\]/).pop()}
