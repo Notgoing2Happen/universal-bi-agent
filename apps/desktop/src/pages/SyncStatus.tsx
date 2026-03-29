@@ -67,12 +67,16 @@ export default function SyncStatus() {
   }
 
   async function toggleWatch() {
-    if (status?.watching) {
-      await call('sync.stop');
-    } else {
-      await call('sync.start');
+    try {
+      if (status?.watching) {
+        await call('sync.stop');
+      } else {
+        await call('sync.start');
+      }
+      refresh();
+    } catch {
+      // Sidecar not running — ignore
     }
-    refresh();
   }
 
   const badgeStyle = (s: string): React.CSSProperties => ({

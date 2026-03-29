@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom';
+import { HashRouter, Routes, Route, NavLink } from 'react-router-dom';
 import Settings from './pages/Settings';
 import SyncStatus from './pages/SyncStatus';
 import FolderManager from './pages/FolderManager';
@@ -13,7 +13,7 @@ const navItems = [
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <div style={{ display: 'flex', height: '100vh' }}>
         {/* Sidebar */}
         <nav style={{
@@ -63,6 +63,6 @@ export default function App() {
           </Routes>
         </main>
       </div>
-    </BrowserRouter>
+    </HashRouter>
   );
 }
