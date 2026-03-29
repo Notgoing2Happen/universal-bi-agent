@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -8,6 +8,8 @@ use std::os::windows::process::CommandExt;
 
 struct SidecarState {
     child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    reader: Option<BufReader<ChildStdout>>,
 }
 
 #[tauri::command]
@@ -31,24 +33,25 @@ async fn sidecar_rpc(
     std::thread::spawn(move || {
         let result = (|| -> Result<serde_json::Value, String> {
             let mut guard = state.lock().map_err(|e| e.to_string())?;
-            let child = guard
-                .child
-                .as_mut()
-                .ok_or("Sidecar not running")?;
+            let sc = &mut *guard;
 
             // Check if sidecar process is still alive
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return Err(format!("Sidecar exited with status: {}", status));
+            if let Some(child) = sc.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        return Err(format!("Sidecar exited with status: {}", status));
+                    }
+                    Ok(None) => {} // still running
+                    Err(e) => {
+                        return Err(format!("Failed to check sidecar status: {}", e));
+                    }
                 }
-                Ok(None) => {} // still running
-                Err(e) => {
-                    return Err(format!("Failed to check sidecar status: {}", e));
-                }
+            } else {
+                return Err("Sidecar not running".to_string());
             }
 
-            let stdin = child.stdin.as_mut().ok_or("No stdin")?;
-            let stdout = child.stdout.as_mut().ok_or("No stdout")?;
+            let stdin = sc.stdin.as_mut().ok_or("No stdin")?;
+            let reader = sc.reader.as_mut().ok_or("No stdout reader")?;
 
             // Build JSON-RPC request
             let request = serde_json::json!({
@@ -64,33 +67,41 @@ async fn sidecar_rpc(
             stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
             stdin.flush().map_err(|e| e.to_string())?;
 
-            // Read response line
-            let mut reader = BufReader::new(stdout);
-            let mut response_line = String::new();
-            match reader.read_line(&mut response_line) {
-                Ok(0) => {
-                    return Err("Sidecar closed connection (EOF)".to_string());
+            // Read response lines, skipping any notifications (messages without "id")
+            loop {
+                let mut response_line = String::new();
+                match reader.read_line(&mut response_line) {
+                    Ok(0) => {
+                        return Err("Sidecar closed connection (EOF)".to_string());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(format!("Read error: {}", e));
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(format!("Read error: {}", e));
+
+                let trimmed = response_line.trim();
+                if trimmed.is_empty() {
+                    continue;
                 }
+
+                let response: serde_json::Value =
+                    serde_json::from_str(trimmed).map_err(|e| {
+                        format!("Invalid JSON from sidecar: {} (raw: {:?})", e, trimmed)
+                    })?;
+
+                // Skip notifications (no "id" field) — these are events like event.ready
+                if response.get("id").is_none() {
+                    eprintln!("[Tauri] Skipping sidecar notification: {}", trimmed);
+                    continue;
+                }
+
+                if let Some(error) = response.get("error") {
+                    return Err(error.to_string());
+                }
+
+                return Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null));
             }
-
-            if response_line.trim().is_empty() {
-                return Err("Sidecar returned empty response".to_string());
-            }
-
-            let response: serde_json::Value =
-                serde_json::from_str(&response_line).map_err(|e| {
-                    format!("Invalid JSON from sidecar: {} (raw: {:?})", e, response_line)
-                })?;
-
-            if let Some(error) = response.get("error") {
-                return Err(error.to_string());
-            }
-
-            Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
         })();
         let _ = tx.send(result);
     });
@@ -176,13 +187,26 @@ pub fn run() {
                         });
                     }
 
-                    app.manage(Arc::new(Mutex::new(SidecarState { child: Some(child) })));
+                    // Take ownership of stdin/stdout for persistent buffered I/O
+                    let stdin = child.stdin.take();
+                    let stdout = child.stdout.take();
+                    let reader = stdout.map(BufReader::new);
+
+                    app.manage(Arc::new(Mutex::new(SidecarState {
+                        child: Some(child),
+                        stdin,
+                        reader,
+                    })));
                 }
                 Err(e) => {
                     eprintln!("[Tauri] Failed to start sidecar: {}", e);
                     eprintln!("[Tauri] Path tried: {:?}", sidecar_path);
                     // Start without sidecar — UI still works, just no sync
-                    app.manage(Arc::new(Mutex::new(SidecarState { child: None })));
+                    app.manage(Arc::new(Mutex::new(SidecarState {
+                        child: None,
+                        stdin: None,
+                        reader: None,
+                    })));
                 }
             }
 
