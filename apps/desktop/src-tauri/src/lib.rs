@@ -113,34 +113,36 @@ pub fn run() {
             let resource_dir = app.path().resource_dir()
                 .expect("Failed to get resource dir");
 
-            let sidecar_name = if cfg!(target_os = "windows") {
-                "universal-bi-sidecar.exe"
+            let ext = if cfg!(target_os = "windows") { ".exe" } else { "" };
+            let target_triple = if cfg!(target_os = "windows") {
+                "x86_64-pc-windows-msvc"
+            } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+                "aarch64-apple-darwin"
+            } else if cfg!(target_os = "macos") {
+                "x86_64-apple-darwin"
             } else {
-                "universal-bi-sidecar"
+                "x86_64-unknown-linux-gnu"
             };
 
-            // Try externalBin path first (production), then binaries/ (dev)
-            let sidecar_path = resource_dir.join(sidecar_name);
-            let sidecar_path = if sidecar_path.exists() {
-                sidecar_path
-            } else {
-                // In development, the binary is in src-tauri/binaries/
-                let target_triple = if cfg!(target_os = "windows") {
-                    "x86_64-pc-windows-msvc"
-                } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-                    "aarch64-apple-darwin"
-                } else if cfg!(target_os = "macos") {
-                    "x86_64-apple-darwin"
-                } else {
-                    "x86_64-unknown-linux-gnu"
-                };
-                let dev_name = format!("universal-bi-sidecar-{}{}", target_triple,
-                    if cfg!(target_os = "windows") { ".exe" } else { "" });
-                app.path().resource_dir()
-                    .unwrap()
-                    .join("binaries")
-                    .join(dev_name)
-            };
+            // Try multiple paths in order:
+            // 1. Production (Tauri strips target triple): {resource}/binaries/sidecar[.exe]
+            // 2. Root resource dir: {resource}/sidecar[.exe]
+            // 3. Dev mode (with target triple): {resource}/binaries/sidecar-{triple}[.exe]
+            let candidates = vec![
+                resource_dir.join("binaries").join(format!("universal-bi-sidecar{}", ext)),
+                resource_dir.join(format!("universal-bi-sidecar{}", ext)),
+                resource_dir.join("binaries").join(format!("universal-bi-sidecar-{}{}", target_triple, ext)),
+            ];
+
+            eprintln!("[Tauri] Resource dir: {:?}", resource_dir);
+            for (i, p) in candidates.iter().enumerate() {
+                eprintln!("[Tauri] Candidate {}: {:?} (exists: {})", i, p, p.exists());
+            }
+
+            let sidecar_path = candidates.iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
 
             eprintln!("[Tauri] Starting sidecar: {:?}", sidecar_path);
 
@@ -149,7 +151,7 @@ pub fn run() {
             cmd.env("NODE_ENV", "production")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+                .stderr(Stdio::piped());
 
             // On Windows, prevent the sidecar from opening a visible console window.
             // CREATE_NO_WINDOW = 0x08000000
@@ -158,8 +160,22 @@ pub fn run() {
 
             match cmd.spawn()
             {
-                Ok(child) => {
+                Ok(mut child) => {
                     eprintln!("[Tauri] Sidecar started (pid: {})", child.id());
+
+                    // Spawn a thread to log sidecar stderr output
+                    if let Some(stderr) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let reader = BufReader::new(stderr);
+                            for line in reader.lines() {
+                                match line {
+                                    Ok(l) => eprintln!("[Sidecar] {}", l),
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+
                     app.manage(Arc::new(Mutex::new(SidecarState { child: Some(child) })));
                 }
                 Err(e) => {
