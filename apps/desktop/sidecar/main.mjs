@@ -41,12 +41,11 @@ setWatcherEventCallback((event, data) => {
 
 // Config handlers
 registerHandler('config.get', async () => {
-  const config = loadConfig();
-  return config;
+  return loadConfig() || { platformUrl: '', apiKey: '', watchFolders: [] };
 });
 
 registerHandler('config.set', async (params) => {
-  const config = loadConfig();
+  const config = loadConfig() || { platformUrl: '', apiKey: '', watchFolders: [] };
   if (params.platformUrl !== undefined) config.platformUrl = params.platformUrl;
   if (params.apiKey !== undefined) config.apiKey = params.apiKey;
   if (params.googleAiKey !== undefined) config.googleAiKey = params.googleAiKey;
