@@ -7,6 +7,19 @@ interface Config {
   googleAiKey?: string;
 }
 
+function decodeSetupToken(token: string): { platformUrl: string; apiKey: string } | null {
+  try {
+    const json = atob(token.trim());
+    const data = JSON.parse(json);
+    if (data.u && data.k) {
+      return { platformUrl: data.u, apiKey: data.k };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export default function Settings() {
   const { call, connected } = useSidecar();
   const [config, setConfig] = useState<Config>({
@@ -18,6 +31,11 @@ export default function Settings() {
   const [saved, setSaved] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [setupCode, setSetupCode] = useState('');
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [setupApplied, setSetupApplied] = useState(false);
+
+  const needsSetup = connected && !config.platformUrl && !config.apiKey;
 
   useEffect(() => {
     if (!connected) return;
@@ -33,6 +51,34 @@ export default function Settings() {
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
       setTestResult(`Save failed: ${err}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function applySetupCode() {
+    setSetupError(null);
+    const decoded = decodeSetupToken(setupCode);
+    if (!decoded) {
+      setSetupError('Invalid setup code. Copy it from the platform download page.');
+      return;
+    }
+    setSaving(true);
+    try {
+      await call('config.set', {
+        platformUrl: decoded.platformUrl,
+        apiKey: decoded.apiKey,
+      });
+      setConfig(prev => ({
+        ...prev,
+        platformUrl: decoded.platformUrl,
+        apiKey: decoded.apiKey,
+      }));
+      setSetupApplied(true);
+      setSetupCode('');
+      setTimeout(() => setSetupApplied(false), 5000);
+    } catch (err) {
+      setSetupError(`Failed to apply: ${err}`);
     } finally {
       setSaving(false);
     }
@@ -86,6 +132,49 @@ export default function Settings() {
       {!connected && (
         <div style={{ padding: 12, background: '#7f1d1d', borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
           Sidecar not connected. Start the sidecar process first.
+        </div>
+      )}
+
+      {/* Quick Setup Code */}
+      {connected && (
+        <div style={{
+          maxWidth: 500,
+          marginBottom: 24,
+          padding: 20,
+          background: needsSetup ? '#172554' : '#1e293b',
+          border: needsSetup ? '1px solid #2563eb' : '1px solid #334155',
+          borderRadius: 8,
+        }}>
+          <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 8, color: needsSetup ? '#93c5fd' : '#e2e8f0' }}>
+            {needsSetup ? 'Quick Setup' : 'Setup Code'}
+          </h3>
+          <p style={{ fontSize: 12, color: '#94a3b8', marginBottom: 12 }}>
+            Paste the setup code from the platform download page to connect automatically.
+          </p>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              style={{ ...inputStyle, flex: 1 }}
+              type="text"
+              placeholder="Paste setup code here..."
+              value={setupCode}
+              onChange={e => { setSetupCode(e.target.value); setSetupError(null); }}
+            />
+            <button
+              style={{ ...buttonStyle, background: '#2563eb', color: 'white', flexShrink: 0 }}
+              onClick={applySetupCode}
+              disabled={saving || !setupCode.trim()}
+            >
+              {saving ? 'Applying...' : 'Apply'}
+            </button>
+          </div>
+          {setupError && (
+            <div style={{ marginTop: 8, fontSize: 12, color: '#f87171' }}>{setupError}</div>
+          )}
+          {setupApplied && (
+            <div style={{ marginTop: 8, fontSize: 12, color: '#4ade80' }}>
+              Connected! Platform URL and API key configured.
+            </div>
+          )}
         </div>
       )}
 

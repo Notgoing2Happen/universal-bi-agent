@@ -116,9 +116,17 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
             window.set_title("Universal BI Agent").unwrap();
+
+            // Register deep link scheme for dev mode
+            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _ = app.deep_link().register_all();
+            }
 
             // Resolve sidecar binary path
             let resource_dir = app.path().resource_dir()

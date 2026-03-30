@@ -9,14 +9,25 @@ interface WatchFolder {
   addedAt: string;
 }
 
+interface SyncedFile {
+  path: string;
+  size: number;
+  lastSynced: string | null;
+  status: 'synced' | 'error' | 'pending';
+}
+
 export default function FolderManager() {
   const { call, connected } = useSidecar();
   const [folders, setFolders] = useState<WatchFolder[]>([]);
-  const [, setImportedFiles] = useState<FileEntry[]>([]);
+  const [syncedFiles, setSyncedFiles] = useState<SyncedFile[]>([]);
 
   useEffect(() => {
     if (!connected) return;
     call<WatchFolder[]>('folders.list').then(f => setFolders(f || [])).catch(() => {});
+    // Load persisted synced files from sidecar state
+    call<{ files: SyncedFile[] }>('sync.status')
+      .then(s => setSyncedFiles(s?.files || []))
+      .catch(() => {});
   }, [connected, call]);
 
   async function handleAddFolder() {
@@ -81,8 +92,6 @@ export default function FolderManager() {
   }
 
   async function handleFilesDropped(files: FileEntry[]) {
-    setImportedFiles(prev => [...files, ...prev].slice(0, 20));
-
     // Send each dropped file to the sidecar for processing
     for (const file of files) {
       try {
@@ -91,6 +100,11 @@ export default function FolderManager() {
         console.error(`Failed to import ${file.name}:`, err);
       }
     }
+    // Refresh the synced files list from persistent state
+    try {
+      const status = await call<{ files: SyncedFile[] }>('sync.status');
+      setSyncedFiles(status?.files || []);
+    } catch { /* ignore */ }
   }
 
   return (
@@ -191,6 +205,53 @@ export default function FolderManager() {
               </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Synced files list (persisted across navigation) */}
+      {syncedFiles.length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <h3 style={{ fontSize: 14, color: '#64748b', fontWeight: 500, marginBottom: 12 }}>
+            Synced Files ({syncedFiles.length})
+          </h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {syncedFiles.map(f => {
+              const name = f.path.split(/[/\\]/).pop() || f.path;
+              const ext = name.includes('.') ? '.' + name.split('.').pop()?.toLowerCase() : '';
+              return (
+                <div key={f.path} style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '8px 12px',
+                  background: '#1e293b',
+                  borderRadius: 6,
+                  fontSize: 13,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <span>{ext === '.csv' ? '📊' : ext === '.json' ? '📋' : '📑'}</span>
+                    <span style={{ color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {name}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+                    <span style={{ fontSize: 11, color: '#64748b' }}>
+                      {f.size > 0 ? (f.size < 1024 * 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${(f.size / (1024 * 1024)).toFixed(1)} MB`) : ''}
+                    </span>
+                    <span style={{
+                      fontSize: 11,
+                      padding: '2px 8px',
+                      borderRadius: 4,
+                      background: f.status === 'synced' ? '#14532d' : f.status === 'error' ? '#7f1d1d' : '#1e3a5f',
+                      color: f.status === 'synced' ? '#4ade80' : f.status === 'error' ? '#f87171' : '#60a5fa',
+                    }}>
+                      {f.status}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </div>
