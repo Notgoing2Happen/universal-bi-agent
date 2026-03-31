@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { HashRouter, Routes, Route, NavLink, useNavigate } from 'react-router-dom';
 import Settings from './pages/Settings';
 import SyncStatus from './pages/SyncStatus';
@@ -56,11 +56,25 @@ async function applySetupFromUrl(url: string): Promise<boolean> {
 function AppContent() {
   const navigate = useNavigate();
   const [setupBanner, setSetupBanner] = useState<string | null>(null);
+  const processedUrls = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (!isTauri) return;
 
     let cancelled = false;
+
+    async function handleDeepLink(url: string) {
+      // Prevent re-processing the same deep link URL (fixes navigation bounce-back)
+      if (cancelled || processedUrls.current.has(url)) return;
+      processedUrls.current.add(url);
+
+      const success = await applySetupFromUrl(url);
+      if (success && !cancelled) {
+        setSetupBanner('Connected to platform! Configuration applied automatically.');
+        navigate('/settings');
+        setTimeout(() => setSetupBanner(null), 8000);
+      }
+    }
 
     async function initDeepLinks() {
       try {
@@ -69,13 +83,8 @@ function AppContent() {
         // Check if app was launched via deep link (cold start)
         try {
           const urls = await getCurrent();
-          if (urls?.length && !cancelled) {
-            const success = await applySetupFromUrl(urls[0]);
-            if (success) {
-              setSetupBanner('Connected to platform! Configuration applied automatically.');
-              navigate('/settings');
-              setTimeout(() => setSetupBanner(null), 8000);
-            }
+          if (urls?.length) {
+            await handleDeepLink(urls[0]);
           }
         } catch {
           // No deep link on startup — normal launch
@@ -83,13 +92,8 @@ function AppContent() {
 
         // Listen for deep links while app is running
         await onOpenUrl(async (urls: string[]) => {
-          if (urls.length && !cancelled) {
-            const success = await applySetupFromUrl(urls[0]);
-            if (success) {
-              setSetupBanner('Connected to platform! Configuration applied automatically.');
-              navigate('/settings');
-              setTimeout(() => setSetupBanner(null), 8000);
-            }
+          if (urls.length) {
+            await handleDeepLink(urls[0]);
           }
         });
       } catch (err) {
