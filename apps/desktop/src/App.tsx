@@ -68,10 +68,16 @@ function AppContent() {
       if (cancelled || processedUrls.current.has(url)) return;
       processedUrls.current.add(url);
 
+      // Also check localStorage to prevent re-processing across app restarts
+      // (Tauri may return the same launch URL from getCurrent() every time)
+      const processedKey = `deeplink_processed_${url.substring(0, 60)}`;
+      if (localStorage.getItem(processedKey)) return;
+
       const success = await applySetupFromUrl(url);
       if (success && !cancelled) {
+        localStorage.setItem(processedKey, Date.now().toString());
         setSetupBanner('Connected to platform! Configuration applied automatically.');
-        navigate('/settings');
+        navigate('/');  // Go to Sync Status (home) — setup is done
         setTimeout(() => setSetupBanner(null), 8000);
       }
     }
