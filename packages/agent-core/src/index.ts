@@ -79,6 +79,12 @@ export {
   type SchemaCacheEntry,
 } from './schema-cache';
 
+// Query Server (serves local file data to platform)
+export {
+  startQueryServer,
+  stopQueryServer,
+} from './query-server';
+
 // Data Bridge (local transform pipeline)
 export {
   resolveColumnNames,

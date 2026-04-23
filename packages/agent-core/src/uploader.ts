@@ -136,6 +136,34 @@ function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: n
 }
 
 /**
+ * Parse an Excel file and extract schema + sample values.
+ */
+function parseExcelSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number; sheets: string[] } {
+  const XLSX = require('xlsx');
+  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const sheets = workbook.SheetNames;
+
+  if (sheets.length === 0) return { columns: [], rowCount: 0, sheets: [] };
+
+  // Parse first sheet
+  const sheet = workbook.Sheets[sheets[0]];
+  const rows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(sheet, { defval: null });
+
+  if (rows.length === 0) return { columns: [], rowCount: 0, sheets };
+
+  const colNames = new Set<string>();
+  rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
+
+  const columns: ParsedColumn[] = Array.from(colNames).map(name => {
+    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[name] ?? null);
+    const type = inferType(samples);
+    return { name, type, samples };
+  });
+
+  return { columns, rowCount: rows.length, sheets };
+}
+
+/**
  * Infer column type from sample values.
  */
 function inferType(samples: unknown[]): string {
@@ -206,9 +234,12 @@ export async function uploadFile(
       const result = parseJsonSchema(buffer);
       columns = result.columns;
       rowCount = result.rowCount;
+    } else if (fileType === 'excel') {
+      const result = parseExcelSchema(buffer);
+      columns = result.columns;
+      rowCount = result.rowCount;
     } else {
-      // Excel — fall back to legacy upload for now (needs xlsx library)
-      return uploadFileLegacy(resolved, config);
+      return { success: false, error: `Unsupported file type: ${fileType}` };
     }
   } catch (err) {
     return { success: false, error: `Failed to parse file: ${err instanceof Error ? err.message : err}` };
@@ -286,56 +317,6 @@ export async function uploadFile(
     error: `Failed after ${config.maxRetries + 1} attempts: ${lastError}`,
     retries: config.maxRetries,
   };
-}
-
-/**
- * Legacy file upload — for Excel files that need the xlsx library,
- * or as a fallback. Sends the full file via multipart.
- */
-async function uploadFileLegacy(
-  filePath: string,
-  config: AgentConfig
-): Promise<UploadResult> {
-  const buffer = fs.readFileSync(filePath);
-  const fileName = path.basename(filePath);
-  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-
-  const existing = getFileState(filePath);
-  if (existing && existing.hash === hash) {
-    return { success: true, unchanged: true, connectionId: existing.connectionId || undefined };
-  }
-
-  const blob = new Blob([buffer]);
-  const formData = new FormData();
-  formData.append('file', blob, fileName);
-  formData.append('agentFilePath', filePath);
-
-  try {
-    const response = await fetch(`${config.platformUrl}/api/agent/sync`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'X-Agent-File-Hash': hash,
-      },
-      body: formData,
-    });
-
-    if (response.ok) {
-      const result = await response.json();
-      recordSync(filePath, hash, result.connectionId || null, fs.statSync(filePath).size);
-      return {
-        success: true,
-        unchanged: result.unchanged || false,
-        connectionId: result.connectionId,
-        isNew: result.isNew,
-      };
-    }
-
-    const errorBody = await response.json().catch(() => ({ error: response.statusText }));
-    return { success: false, error: errorBody.error || `HTTP ${response.status}` };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
-  }
 }
 
 /**

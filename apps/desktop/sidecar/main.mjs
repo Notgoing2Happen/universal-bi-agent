@@ -11,6 +11,8 @@
 
 import { WebSocketServer } from 'ws';
 import {
+  startQueryServer,
+  stopQueryServer,
   startIpcServer,
   registerHandler,
   getHandler,
@@ -217,6 +219,39 @@ registerHandler('schema.getConcepts', async () => {
 registerHandler('schema.cacheConcepts', async (params) => {
   cacheConcepts(params.concepts);
   return { ok: true };
+});
+
+// ─── Query Server (serves local file data to platform) ───────────────
+
+const QUERY_SERVER_PORT = 9322;
+
+// Start query server automatically — platform can reach it at localhost:9322
+startQueryServer(QUERY_SERVER_PORT).then(() => {
+  console.error(`[Sidecar] Query server started on port ${QUERY_SERVER_PORT}`);
+
+  // Register the query server URL with the platform so Cube.js knows where to reach us
+  const config = loadConfig();
+  if (config.platformUrl && config.apiKey) {
+    fetch(`${config.platformUrl}/api/agent/register`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        queryServerUrl: `http://localhost:${QUERY_SERVER_PORT}`,
+        agentVersion: '0.1.19',
+      }),
+    }).catch(err => {
+      console.error('[Sidecar] Failed to register query server with platform:', err.message);
+    });
+  }
+}).catch(err => {
+  console.error('[Sidecar] Query server failed to start:', err.message);
+});
+
+registerHandler('query.status', async () => {
+  return { running: true, port: QUERY_SERVER_PORT, url: `http://localhost:${QUERY_SERVER_PORT}` };
 });
 
 // ─── Start IPC (stdio for Tauri, WebSocket for dev) ─────────────────
