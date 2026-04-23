@@ -1,11 +1,16 @@
 /**
- * Agent HTTP Uploader
+ * Agent Schema Uploader
  *
- * Uploads files to the platform's POST /api/agent/sync endpoint.
- * Includes:
- * - Content hash header for server-side skip
- * - Exponential backoff retry on failure
- * - File locking protection (stability threshold)
+ * Parses local files and sends **schema metadata only** to the platform.
+ * The full file stays on the user's machine — zero data uploaded.
+ *
+ * Flow:
+ * 1. Parse file locally (CSV, Excel, JSON)
+ * 2. Extract column names, types, and ~10 sample values per column
+ * 3. Compute schema hash for change detection
+ * 4. POST schema metadata to /api/agent/sync (JSON, not multipart)
+ * 5. Platform runs AI mapping on the metadata
+ * 6. Sample values used in-memory for mapping, then discarded
  */
 
 import * as fs from 'fs';
@@ -23,8 +28,149 @@ export interface UploadResult {
   retries?: number;
 }
 
+interface ParsedColumn {
+  name: string;
+  type: string;
+  samples: unknown[];
+}
+
+const SAMPLE_ROWS = 10;
+
 /**
- * Upload a file to the platform with retry logic.
+ * Parse a CSV file and extract schema + sample values.
+ */
+function parseCsvSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number } {
+  const text = buffer.toString('utf-8');
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+
+  if (lines.length === 0) return { columns: [], rowCount: 0 };
+
+  // Parse header
+  const headers = parseCsvLine(lines[0]);
+
+  // Parse sample rows
+  const sampleRows: string[][] = [];
+  for (let i = 1; i < Math.min(lines.length, SAMPLE_ROWS + 1); i++) {
+    sampleRows.push(parseCsvLine(lines[i]));
+  }
+
+  const columns: ParsedColumn[] = headers.map((name, idx) => {
+    const samples = sampleRows.map(row => {
+      const val = row[idx] ?? '';
+      // Try to parse as number
+      const num = Number(val);
+      if (val !== '' && !isNaN(num)) return num;
+      // Try boolean
+      if (val.toLowerCase() === 'true') return true;
+      if (val.toLowerCase() === 'false') return false;
+      return val;
+    });
+
+    // Infer type from samples
+    const type = inferType(samples);
+    return { name, type, samples };
+  });
+
+  return { columns, rowCount: lines.length - 1 }; // -1 for header
+}
+
+/**
+ * Parse a single CSV line handling quoted fields.
+ */
+function parseCsvLine(line: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+/**
+ * Parse a JSON file and extract schema + sample values.
+ */
+function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number } {
+  const text = buffer.toString('utf-8');
+  const parsed = JSON.parse(text);
+
+  let rows: Record<string, unknown>[];
+  if (Array.isArray(parsed)) {
+    rows = parsed;
+  } else if (typeof parsed === 'object' && parsed !== null) {
+    // Try to find an array in the first level
+    const arrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
+    rows = arrayKey ? parsed[arrayKey] : [parsed];
+  } else {
+    return { columns: [], rowCount: 0 };
+  }
+
+  if (rows.length === 0) return { columns: [], rowCount: 0 };
+
+  // Collect all column names
+  const colNames = new Set<string>();
+  rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
+
+  const columns: ParsedColumn[] = Array.from(colNames).map(name => {
+    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[name] ?? null);
+    const type = inferType(samples);
+    return { name, type, samples };
+  });
+
+  return { columns, rowCount: rows.length };
+}
+
+/**
+ * Infer column type from sample values.
+ */
+function inferType(samples: unknown[]): string {
+  const nonNull = samples.filter(s => s !== null && s !== undefined && s !== '');
+  if (nonNull.length === 0) return 'string';
+
+  const allNumbers = nonNull.every(s => typeof s === 'number');
+  if (allNumbers) {
+    return nonNull.every(s => Number.isInteger(s)) ? 'integer' : 'float';
+  }
+
+  const allBooleans = nonNull.every(s => typeof s === 'boolean');
+  if (allBooleans) return 'boolean';
+
+  // Check for date patterns
+  const datePattern = /^\d{4}-\d{2}-\d{2}|^\d{1,2}\/\d{1,2}\/\d{2,4}/;
+  if (nonNull.every(s => typeof s === 'string' && datePattern.test(s))) return 'datetime';
+
+  return 'string';
+}
+
+/**
+ * Detect file type from extension.
+ */
+function detectFileType(fileName: string): string {
+  const ext = fileName.toLowerCase().split('.').pop();
+  if (ext === 'csv' || ext === 'tsv') return 'csv';
+  if (ext === 'json') return 'json';
+  if (ext === 'xlsx' || ext === 'xls') return 'excel';
+  return 'unknown';
+}
+
+/**
+ * Upload file schema (metadata only) to the platform.
+ * The full file stays on the user's machine.
  */
 export async function uploadFile(
   filePath: string,
@@ -32,56 +178,82 @@ export async function uploadFile(
 ): Promise<UploadResult> {
   const resolved = path.resolve(filePath);
 
-  // Check file exists and is readable
+  // Check file exists
   if (!fs.existsSync(resolved)) {
     return { success: false, error: `File not found: ${resolved}` };
   }
 
   const stats = fs.statSync(resolved);
+  const fileName = path.basename(resolved);
+  const fileType = detectFileType(fileName);
 
-  // Check file size
-  if (stats.size > config.maxFileSize) {
-    return {
-      success: false,
-      error: `File too large: ${(stats.size / 1024 / 1024).toFixed(1)}MB (max ${(config.maxFileSize / 1024 / 1024).toFixed(0)}MB)`,
-    };
+  if (fileType === 'unknown') {
+    return { success: false, error: `Unsupported file type: ${fileName}` };
   }
 
-  // Read file and compute hash
+  // Read and parse the file locally
   const buffer = fs.readFileSync(resolved);
-  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
 
-  // Check local state — skip if hash unchanged
+  let columns: ParsedColumn[];
+  let rowCount: number;
+
+  try {
+    if (fileType === 'csv') {
+      const result = parseCsvSchema(buffer);
+      columns = result.columns;
+      rowCount = result.rowCount;
+    } else if (fileType === 'json') {
+      const result = parseJsonSchema(buffer);
+      columns = result.columns;
+      rowCount = result.rowCount;
+    } else {
+      // Excel — fall back to legacy upload for now (needs xlsx library)
+      return uploadFileLegacy(resolved, config);
+    }
+  } catch (err) {
+    return { success: false, error: `Failed to parse file: ${err instanceof Error ? err.message : err}` };
+  }
+
+  if (columns.length === 0) {
+    return { success: false, error: 'No columns found in file' };
+  }
+
+  // Compute schema hash (columns + types, NOT data) for change detection
+  const schemaFingerprint = columns.map(c => `${c.name}:${c.type}`).join('|');
+  const schemaHash = crypto.createHash('sha256').update(schemaFingerprint).digest('hex');
+
+  // Check local state — skip if schema unchanged
   const existing = getFileState(resolved);
-  if (existing && existing.hash === hash) {
+  if (existing && existing.hash === schemaHash) {
     return { success: true, unchanged: true, connectionId: existing.connectionId || undefined };
   }
 
-  // Build multipart form data
-  const fileName = path.basename(resolved);
-  const blob = new Blob([buffer]);
-
+  // Send schema metadata (NOT the file) to the platform
   let lastError = '';
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
-      const formData = new FormData();
-      formData.append('file', blob, fileName);
-      formData.append('agentFilePath', resolved);
-
       const response = await fetch(`${config.platformUrl}/api/agent/sync`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${config.apiKey}`,
-          'X-Agent-File-Hash': hash,
+          'Content-Type': 'application/json',
         },
-        body: formData,
+        body: JSON.stringify({
+          fileName,
+          fileType,
+          schemaHash,
+          agentFilePath: resolved,
+          columns,
+          rowCount,
+          fileSize: stats.size,
+        }),
       });
 
       if (response.ok) {
         const result = await response.json();
 
-        // Record successful sync in local state
-        recordSync(resolved, hash, result.connectionId || null, stats.size);
+        // Record successful sync (using schema hash, not file hash)
+        recordSync(resolved, schemaHash, result.connectionId || null, stats.size);
 
         return {
           success: true,
@@ -92,22 +264,16 @@ export async function uploadFile(
         };
       }
 
-      // Non-retryable errors (client errors)
       if (response.status >= 400 && response.status < 500) {
         const errorBody = await response.json().catch(() => ({ error: response.statusText }));
-        return {
-          success: false,
-          error: errorBody.error || `HTTP ${response.status}`,
-        };
+        return { success: false, error: errorBody.error || `HTTP ${response.status}` };
       }
 
-      // Server error — retry with backoff
       lastError = `HTTP ${response.status}: ${response.statusText}`;
     } catch (err) {
       lastError = err instanceof Error ? err.message : 'Unknown network error';
     }
 
-    // Exponential backoff: 1s, 2s, 4s
     if (attempt < config.maxRetries) {
       const delay = config.retryBaseDelay * Math.pow(2, attempt);
       console.log(`  Retry ${attempt + 1}/${config.maxRetries} in ${delay}ms...`);
@@ -120,6 +286,56 @@ export async function uploadFile(
     error: `Failed after ${config.maxRetries + 1} attempts: ${lastError}`,
     retries: config.maxRetries,
   };
+}
+
+/**
+ * Legacy file upload — for Excel files that need the xlsx library,
+ * or as a fallback. Sends the full file via multipart.
+ */
+async function uploadFileLegacy(
+  filePath: string,
+  config: AgentConfig
+): Promise<UploadResult> {
+  const buffer = fs.readFileSync(filePath);
+  const fileName = path.basename(filePath);
+  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+  const existing = getFileState(filePath);
+  if (existing && existing.hash === hash) {
+    return { success: true, unchanged: true, connectionId: existing.connectionId || undefined };
+  }
+
+  const blob = new Blob([buffer]);
+  const formData = new FormData();
+  formData.append('file', blob, fileName);
+  formData.append('agentFilePath', filePath);
+
+  try {
+    const response = await fetch(`${config.platformUrl}/api/agent/sync`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'X-Agent-File-Hash': hash,
+      },
+      body: formData,
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      recordSync(filePath, hash, result.connectionId || null, fs.statSync(filePath).size);
+      return {
+        success: true,
+        unchanged: result.unchanged || false,
+        connectionId: result.connectionId,
+        isNew: result.isNew,
+      };
+    }
+
+    const errorBody = await response.json().catch(() => ({ error: response.statusText }));
+    return { success: false, error: errorBody.error || `HTTP ${response.status}` };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
 }
 
 /**
@@ -142,21 +358,18 @@ export async function syncDirectory(
 
   for (const file of files) {
     console.log(`Syncing: ${path.relative(dirPath, file)}`);
-
     const result = await uploadFile(file, config);
 
     if (result.success) {
       if (result.unchanged) {
         unchanged++;
-        console.log(`  Unchanged (skipped)`);
       } else {
         synced++;
         console.log(`  ${result.isNew ? 'Created' : 'Updated'}: ${result.connectionId}`);
       }
     } else {
       failed++;
-      const errorMsg = `${path.basename(file)}: ${result.error}`;
-      errors.push(errorMsg);
+      errors.push(`${path.basename(file)}: ${result.error}`);
       console.error(`  Failed: ${result.error}`);
     }
   }
@@ -164,9 +377,6 @@ export async function syncDirectory(
   return { synced, unchanged, failed, errors };
 }
 
-/**
- * Collect all files matching extensions in a directory.
- */
 function collectFiles(dirPath: string, extensions: string[], recursive: boolean): string[] {
   const results: string[] = [];
   const resolved = path.resolve(dirPath);
@@ -177,16 +387,12 @@ function collectFiles(dirPath: string, extensions: string[], recursive: boolean)
 
   for (const entry of entries) {
     const fullPath = path.join(resolved, entry.name);
-
     if (entry.isDirectory() && recursive) {
       results.push(...collectFiles(fullPath, extensions, true));
     } else if (entry.isFile()) {
       const ext = path.extname(entry.name).toLowerCase();
-      if (extensions.includes(ext)) {
-        // Skip hidden files and temp files
-        if (!entry.name.startsWith('.') && !entry.name.startsWith('~')) {
-          results.push(fullPath);
-        }
+      if (extensions.includes(ext) && !entry.name.startsWith('.') && !entry.name.startsWith('~')) {
+        results.push(fullPath);
       }
     }
   }
