@@ -91,15 +91,35 @@ export default function FolderManager() {
     setFolders(updated || []);
   }
 
+  const [importStatus, setImportStatus] = useState<{ message: string; isError: boolean } | null>(null);
+
   async function handleFilesDropped(files: FileEntry[]) {
-    // Send each dropped file to the sidecar for processing
+    setImportStatus({ message: `Importing ${files.length} file(s)...`, isError: false });
+
+    let succeeded = 0;
+    let failed = 0;
     for (const file of files) {
       try {
-        await call('sync.importFile', { path: file.path, name: file.name });
+        const result = await call<{ success: boolean; error?: string; connectionId?: string }>('sync.importFile', { path: file.path, name: file.name });
+        if (result?.success) {
+          succeeded++;
+        } else {
+          failed++;
+          console.error(`Import failed for ${file.name}:`, result?.error);
+        }
       } catch (err) {
+        failed++;
         console.error(`Failed to import ${file.name}:`, err);
       }
     }
+
+    if (failed > 0) {
+      setImportStatus({ message: `${succeeded} imported, ${failed} failed. Check file paths.`, isError: true });
+    } else {
+      setImportStatus({ message: `${succeeded} file(s) imported successfully!`, isError: false });
+    }
+    setTimeout(() => setImportStatus(null), 8000);
+
     // Refresh the synced files list from persistent state
     try {
       const status = await call<{ files: SyncedFile[] }>('sync.status');
@@ -144,6 +164,20 @@ export default function FolderManager() {
           </button>
         </div>
       </div>
+
+      {/* Import status banner */}
+      {importStatus && (
+        <div style={{
+          padding: 12,
+          borderRadius: 6,
+          marginBottom: 16,
+          fontSize: 13,
+          background: importStatus.isError ? '#7f1d1d' : '#14532d',
+          color: importStatus.isError ? '#f87171' : '#4ade80',
+        }}>
+          {importStatus.message}
+        </div>
+      )}
 
       {/* Drag and drop zone */}
       <DropZone

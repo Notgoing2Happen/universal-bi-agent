@@ -120,8 +120,39 @@ export default function DropZone({ onFilesDropped, acceptedExtensions, style }: 
     processFiles(e.dataTransfer.files);
   }, [processFiles]);
 
-  const handleClick = () => {
-    fileInputRef.current?.click();
+  const handleClick = async () => {
+    if (isTauri) {
+      // Use Tauri's native file dialog — provides full filesystem paths
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        const selected = await open({
+          multiple: true,
+          title: 'Select data files to import',
+          filters: [{
+            name: 'Data Files',
+            extensions: exts.map(e => e.replace('.', '')),
+          }],
+        });
+
+        if (!selected) return;
+        const paths = Array.isArray(selected) ? selected : [selected];
+        const entries: FileEntry[] = paths.map(p => {
+          const name = p.split(/[/\\]/).pop() || p;
+          const ext = '.' + name.split('.').pop()?.toLowerCase();
+          return { name, path: p, size: 0, type: ext };
+        });
+
+        if (entries.length > 0) {
+          setRecentFiles(prev => [...entries, ...prev].slice(0, 10));
+          onFilesDropped(entries);
+        }
+      } catch (err) {
+        console.error('[DropZone] Tauri file dialog failed:', err);
+      }
+    } else {
+      // Browser fallback
+      fileInputRef.current?.click();
+    }
   };
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
