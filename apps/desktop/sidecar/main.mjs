@@ -102,8 +102,8 @@ registerHandler('sync.status', async () => {
   const files = Object.entries(state.files || {}).map(([path, info]) => ({
     path,
     size: info.size || 0,
-    lastSynced: info.lastSynced || null,
-    status: info.error ? 'error' : info.lastSynced ? 'synced' : 'pending',
+    lastSynced: info.lastSyncedAt || null,
+    status: info.error ? 'error' : info.lastSyncedAt ? 'synced' : 'pending',
   }));
   return {
     watching: isWatching,
@@ -128,17 +128,61 @@ registerHandler('sync.stop', async () => {
 
 registerHandler('sync.oneShot', async () => {
   const config = loadConfig();
+
+  // Sync watch folders
   for (const folder of config.watchFolders || []) {
     await syncDirectory(folder.path, config);
   }
-  return { ok: true };
+
+  // Retry any individually imported files that are still pending
+  const state = loadState();
+  let retried = 0;
+  for (const [filePath, info] of Object.entries(state.files || {})) {
+    if (!info.lastSyncedAt) {
+      console.error(`[Sidecar] Retrying pending file: ${filePath}`);
+      const result = await uploadFile(filePath, config);
+      if (result.success) {
+        retried++;
+        sendEvent('event.syncProgress', {
+          name: filePath.split(/[/\\]/).pop() || filePath,
+          stage: result.unchanged ? 'unchanged' : 'synced',
+        });
+      } else {
+        sendEvent('event.syncProgress', {
+          name: filePath.split(/[/\\]/).pop() || filePath,
+          stage: 'error',
+          error: result.error,
+        });
+      }
+    }
+  }
+
+  return { ok: true, watchFolders: (config.watchFolders || []).length, retriedPending: retried };
 });
 
 registerHandler('sync.importFile', async (params) => {
   const config = loadConfig();
   if (!config.platformUrl || !config.apiKey) {
-    return { ok: false, error: 'Platform URL and API key must be configured first' };
+    return { success: false, error: 'Platform URL and API key must be configured first' };
   }
+
+  // Record file in state immediately (even before upload) so it persists
+  // across tab switches and can be retried via "Sync Now"
+  const fs = await import('fs');
+  const path = await import('path');
+  const resolved = path.default.resolve(params.path);
+  const state = loadState();
+  if (!state.files[resolved]) {
+    state.files[resolved] = {
+      hash: '',
+      connectionId: null,
+      lastSyncedAt: '',  // empty = pending
+      size: fs.default.existsSync(resolved) ? fs.default.statSync(resolved).size : 0,
+    };
+    const { saveState } = await import('@universal-bi/agent-core');
+    saveState(state);
+  }
+
   const result = await uploadFile(params.path, config);
   if (result.success) {
     sendEvent('event.log', {
@@ -146,11 +190,20 @@ registerHandler('sync.importFile', async (params) => {
       message: `Imported: ${params.name || params.path}`,
       timestamp: new Date().toISOString(),
     });
+    sendEvent('event.syncProgress', {
+      name: params.name || params.path,
+      stage: result.unchanged ? 'unchanged' : 'synced',
+    });
   } else {
     sendEvent('event.log', {
       level: 'error',
       message: `Import failed: ${params.name || params.path} — ${result.error}`,
       timestamp: new Date().toISOString(),
+    });
+    sendEvent('event.syncProgress', {
+      name: params.name || params.path,
+      stage: 'error',
+      error: result.error,
     });
   }
   return result;
