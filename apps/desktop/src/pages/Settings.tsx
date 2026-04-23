@@ -129,9 +129,15 @@ export default function Settings() {
     <div>
       <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 24 }}>Settings</h2>
 
-      {!connected && (
+      {connected === false && (
         <div style={{ padding: 12, background: '#7f1d1d', borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
           Sidecar not connected. Start the sidecar process first.
+        </div>
+      )}
+
+      {connected === null && (
+        <div style={{ padding: 12, background: '#1e3a5f', borderRadius: 6, marginBottom: 16, fontSize: 13, color: '#60a5fa' }}>
+          Connecting to sidecar...
         </div>
       )}
 

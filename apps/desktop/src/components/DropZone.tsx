@@ -1,4 +1,6 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
+
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 interface DropZoneProps {
   onFilesDropped: (files: FileEntry[]) => void;
@@ -16,10 +18,9 @@ export interface FileEntry {
 /**
  * Drag-and-drop zone for importing files.
  *
- * Supports:
- * - Drag files from file explorer into the zone
- * - Click to open native file picker
- * - Filters by accepted extensions (csv, xlsx, json, etc.)
+ * In Tauri: uses @tauri-apps/api/event to listen for file drops (browser
+ * drag events don't provide file paths in Tauri's WebView).
+ * In browser: uses standard HTML5 drag-and-drop API.
  */
 export default function DropZone({ onFilesDropped, acceptedExtensions, style }: DropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
@@ -28,13 +29,61 @@ export default function DropZone({ onFilesDropped, acceptedExtensions, style }: 
 
   const exts = acceptedExtensions ?? ['.csv', '.xlsx', '.xls', '.json', '.tsv', '.parquet'];
 
+  // Tauri drag-and-drop: listen for native file drop events
+  useEffect(() => {
+    if (!isTauri) return;
+
+    let unlisten: (() => void) | undefined;
+
+    async function setupTauriDrop() {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+
+        // Tauri v2 drag-drop events
+        const unlistenDrop = await listen<{ paths: string[] }>('tauri://drag-drop', (event) => {
+          setIsDragging(false);
+          const paths = event.payload.paths || [];
+          const entries: FileEntry[] = [];
+          for (const p of paths) {
+            const name = p.split(/[/\\]/).pop() || p;
+            const ext = '.' + name.split('.').pop()?.toLowerCase();
+            if (exts.includes(ext)) {
+              entries.push({ name, path: p, size: 0, type: ext });
+            }
+          }
+          if (entries.length > 0) {
+            setRecentFiles(prev => [...entries, ...prev].slice(0, 10));
+            onFilesDropped(entries);
+          }
+        });
+
+        const unlistenEnter = await listen('tauri://drag-enter', () => setIsDragging(true));
+        const unlistenLeave = await listen('tauri://drag-leave', () => setIsDragging(false));
+
+        unlisten = () => {
+          unlistenDrop();
+          unlistenEnter();
+          unlistenLeave();
+        };
+      } catch (err) {
+        console.error('[DropZone] Failed to set up Tauri drag-drop:', err);
+      }
+    }
+
+    setupTauriDrop();
+    return () => { unlisten?.(); };
+  }, [exts, onFilesDropped]);
+
+  // Browser drag-and-drop handlers (non-Tauri only)
   const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (isTauri) return; // Tauri handles this natively
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(true);
   }, []);
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (isTauri) return;
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
@@ -64,6 +113,7 @@ export default function DropZone({ onFilesDropped, acceptedExtensions, style }: 
   }, [exts, onFilesDropped]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
+    if (isTauri) return; // Tauri handles this natively
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);

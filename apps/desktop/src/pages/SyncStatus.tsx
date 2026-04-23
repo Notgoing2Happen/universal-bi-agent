@@ -139,7 +139,12 @@ export default function SyncStatus() {
         </div>
       </div>
 
-      {!connected && (
+      {connected === null && (
+        <div style={{ padding: 12, background: '#1e3a5f', borderRadius: 6, marginBottom: 16, fontSize: 13, color: '#60a5fa' }}>
+          Connecting...
+        </div>
+      )}
+      {connected === false && (
         <div style={{ padding: 12, background: '#7f1d1d', borderRadius: 6, marginBottom: 16, fontSize: 13 }}>
           Sidecar not connected.
         </div>

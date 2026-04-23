@@ -116,7 +116,9 @@ async function callSidecar(method: string, params?: Record<string, unknown>): Pr
 // ─── React hook ────────────────────────────────────────────────────
 
 export function useSidecar() {
-  const [connected, setConnected] = useState(false);
+  // Start as null (loading) instead of false (error) to avoid showing
+  // the "Sidecar not connected" error flash before the ping completes.
+  const [connected, setConnected] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
