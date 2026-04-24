@@ -84,7 +84,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             bundles: msi,nsis
           - name: macOS Intel
-            runner: macos-13
+            runner: macos-14
             target: x86_64-apple-darwin
             bundles: dmg
           - name: macOS Apple Silicon
@@ -101,6 +101,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # Update version in tauri.conf.json from the git tag (e.g., v0.1.22 → 0.1.22)
+      - name: Set version from tag
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "Setting version to $VERSION"
+          cd apps/desktop/src-tauri
+          node -e "const f='tauri.conf.json'; const c=JSON.parse(require('fs').readFileSync(f,'utf8')); c.version='$VERSION'; require('fs').writeFileSync(f, JSON.stringify(c, null, 2)+'\n');"
+          cat tauri.conf.json | head -5
+        shell: bash
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v2
