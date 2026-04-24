@@ -11,7 +11,7 @@
 import * as path from 'path';
 import chokidar from 'chokidar';
 import { AgentConfig, WatchFolder, loadConfig } from './config';
-import { uploadFile } from './uploader';
+import { uploadFile, notifyFileDeletion } from './uploader';
 import { removeFileState } from './state';
 
 // Track pending uploads to debounce rapid changes
@@ -154,7 +154,6 @@ function watchFolder(folder: WatchFolder, config: AgentConfig): void {
 
   watcher.on('unlink', (filePath: string) => {
     console.log(`[Deleted] ${path.basename(filePath)}`);
-    removeFileState(filePath);
     emitEvent('event.fileChanged', {
       path: filePath,
       name: path.basename(filePath),
@@ -167,6 +166,23 @@ function watchFolder(folder: WatchFolder, config: AgentConfig): void {
       clearTimeout(pending);
       pendingUploads.delete(filePath);
     }
+    // Notify platform to deactivate the connection
+    notifyFileDeletion(filePath, config).then(result => {
+      if (result.success) {
+        console.log(`  → Connection deactivated for deleted file`);
+        emitEvent('event.syncProgress', {
+          path: filePath,
+          name: path.basename(filePath),
+          stage: 'deleted',
+          timestamp: new Date().toISOString(),
+        });
+      } else {
+        console.warn(`  → Failed to notify deletion: ${result.error}`);
+      }
+    }).catch(() => {
+      // Remove local state even if server notification fails
+      removeFileState(filePath);
+    });
   });
 
   watcher.on('error', (error: Error) => {

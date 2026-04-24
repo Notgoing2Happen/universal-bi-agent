@@ -46,6 +46,7 @@ export {
 export {
   uploadFile,
   syncDirectory,
+  notifyFileDeletion,
   type UploadResult,
 } from './uploader';
 

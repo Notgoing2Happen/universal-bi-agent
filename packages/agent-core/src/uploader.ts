@@ -17,7 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { AgentConfig } from './config';
-import { recordSync, getFileState } from './state';
+import { recordSync, getFileState, removeFileState } from './state';
 
 export interface UploadResult {
   success: boolean;
@@ -249,14 +249,21 @@ export async function uploadFile(
     return { success: false, error: 'No columns found in file' };
   }
 
-  // Compute schema hash (columns + types, NOT data) for change detection
+  // Compute two hashes for change detection:
+  // 1. Schema hash (columns + types) — triggers AI re-mapping when columns change
+  // 2. Content hash (schema + row count + file size) — triggers metadata update for new rows
   const schemaFingerprint = columns.map(c => `${c.name}:${c.type}`).join('|');
   const schemaHash = crypto.createHash('sha256').update(schemaFingerprint).digest('hex');
+  const contentFingerprint = `${schemaFingerprint}|rows:${rowCount}|size:${stats.size}`;
+  const contentHash = crypto.createHash('sha256').update(contentFingerprint).digest('hex');
 
-  // Check local state — skip if schema unchanged
+  // Check local state
   const existing = getFileState(resolved);
-  if (existing && existing.hash === schemaHash) {
-    return { success: true, unchanged: true, connectionId: existing.connectionId || undefined };
+  const schemaChanged = !existing || existing.hash !== schemaHash;
+  const contentChanged = !existing || (existing as any).contentHash !== contentHash;
+
+  if (!schemaChanged && !contentChanged) {
+    return { success: true, unchanged: true, connectionId: existing?.connectionId || undefined };
   }
 
   // Send schema metadata (NOT the file) to the platform
@@ -273,6 +280,8 @@ export async function uploadFile(
           fileName,
           fileType,
           schemaHash,
+          contentHash,
+          schemaChanged,        // true = new columns, needs AI re-mapping
           agentFilePath: resolved,
           columns,
           rowCount,
@@ -283,8 +292,14 @@ export async function uploadFile(
       if (response.ok) {
         const result = await response.json();
 
-        // Record successful sync (using schema hash, not file hash)
+        // Record successful sync with both hashes
         recordSync(resolved, schemaHash, result.connectionId || null, stats.size);
+        // Store content hash for row-change detection (extend state)
+        const state = (await import('./state')).loadState();
+        if (state.files[resolved]) {
+          (state.files[resolved] as any).contentHash = contentHash;
+          (await import('./state')).saveState(state);
+        }
 
         return {
           success: true,
@@ -322,6 +337,46 @@ export async function uploadFile(
 /**
  * Upload all supported files from a directory (one-time sync).
  */
+/**
+ * Notify the platform that a local file was deleted.
+ * Deactivates the connection on the server side.
+ */
+export async function notifyFileDeletion(
+  filePath: string,
+  config: AgentConfig
+): Promise<{ success: boolean; error?: string }> {
+  const resolved = path.resolve(filePath);
+  const existing = getFileState(resolved);
+  if (!existing?.connectionId) {
+    return { success: true }; // No connection to deactivate
+  }
+
+  try {
+    const response = await fetch(`${config.platformUrl}/api/agent/sync`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        fileName: path.basename(resolved),
+        agentFilePath: resolved,
+        connectionId: existing.connectionId,
+        deleted: true,
+      }),
+    });
+
+    if (response.ok) {
+      removeFileState(resolved);
+      return { success: true };
+    }
+
+    return { success: false, error: `HTTP ${response.status}` };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
 export async function syncDirectory(
   dirPath: string,
   config: AgentConfig,
