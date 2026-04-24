@@ -208,7 +208,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
       // Auth check — verify the request comes from our platform
       const config = loadConfig();
       const authHeader = req.headers.authorization;
-      if (authHeader !== `Bearer ${config.apiKey}`) {
+      if (!config || authHeader !== `Bearer ${config.apiKey}`) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
