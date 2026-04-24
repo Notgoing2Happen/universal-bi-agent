@@ -27,6 +27,7 @@ import {
   stopWatching,
   setWatcherEventCallback,
   loadState,
+  saveState,
   getStateSummary,
   syncDirectory,
   uploadFile,
@@ -170,18 +171,17 @@ registerHandler('sync.importFile', async (params) => {
 
   // Record file in state immediately (even before upload) so it persists
   // across tab switches and can be retried via "Sync Now"
-  const fs = await import('fs');
-  const path = await import('path');
-  const resolved = path.default.resolve(params.path);
+  const fs = require('fs');
+  const path = require('path');
+  const resolved = path.resolve(params.path);
   const state = loadState();
   if (!state.files[resolved]) {
     state.files[resolved] = {
       hash: '',
       connectionId: null,
       lastSyncedAt: '',  // empty = pending
-      size: fs.default.existsSync(resolved) ? fs.default.statSync(resolved).size : 0,
+      size: fs.existsSync(resolved) ? fs.statSync(resolved).size : 0,
     };
-    const { saveState } = await import('@universal-bi/agent-core');
     saveState(state);
   }
 
