@@ -254,6 +254,105 @@ registerHandler('query.status', async () => {
   return { running: true, port: QUERY_SERVER_PORT, url: `http://localhost:${QUERY_SERVER_PORT}` };
 });
 
+// ─── Query Relay Polling ─────────────────────────────────────────────
+// Poll the platform for pending queries that need local file data.
+// This bridges the NAT gap: Cube.js on the server can't reach our
+// local machine, but we can poll the server for query requests.
+
+let queryPollingActive = false;
+
+async function startQueryPolling() {
+  const config = loadConfig();
+  if (!config.platformUrl || !config.apiKey) {
+    console.error('[Sidecar] Query polling skipped — no platform URL or API key');
+    return;
+  }
+
+  queryPollingActive = true;
+  console.error('[Sidecar] Query relay polling started');
+
+  while (queryPollingActive) {
+    try {
+      // Poll for pending queries
+      const res = await fetch(`${config.platformUrl}/api/agent/queries`, {
+        headers: { 'Authorization': `Bearer ${config.apiKey}` },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (res.ok) {
+        const { queries } = await res.json();
+
+        for (const query of queries || []) {
+          // Process each query locally
+          try {
+            console.error(`[Sidecar] Processing relay query ${query.id} for ${query.filePath}`);
+
+            // Query the local query server
+            const queryRes = await fetch(`http://localhost:${QUERY_SERVER_PORT}/query`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${config.apiKey}`,
+              },
+              body: JSON.stringify({
+                connectionId: query.connectionId,
+                filePath: query.filePath,
+                columns: query.columns,
+                filters: query.filters,
+                limit: query.limit,
+              }),
+            });
+
+            let resultBody;
+            if (queryRes.ok) {
+              const result = await queryRes.json();
+              resultBody = { data: result.data || [] };
+            } else {
+              resultBody = { error: `Local query failed: ${queryRes.status}` };
+            }
+
+            // Post result back to the platform
+            await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${config.apiKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(resultBody),
+            });
+
+            console.error(`[Sidecar] Relay query ${query.id} completed`);
+          } catch (queryErr) {
+            console.error(`[Sidecar] Relay query ${query.id} failed:`, queryErr.message);
+            // Try to report error back
+            try {
+              await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${config.apiKey}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ error: queryErr.message }),
+              });
+            } catch { /* ignore */ }
+          }
+        }
+      }
+    } catch (pollErr) {
+      // Network error — server might be down, try again later
+      if (!pollErr.message?.includes('abort')) {
+        console.error('[Sidecar] Query poll error:', pollErr.message?.substring(0, 60));
+      }
+    }
+
+    // Poll every 2 seconds
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+}
+
+// Start polling after query server is ready
+startQueryPolling();
+
 // ─── Start IPC (stdio for Tauri, WebSocket for dev) ─────────────────
 
 const isDev = process.env.NODE_ENV !== 'production';
