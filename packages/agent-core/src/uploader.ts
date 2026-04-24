@@ -17,7 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { AgentConfig } from './config';
-import { recordSync, getFileState, removeFileState } from './state';
+import { recordSync, getFileState, removeFileState, loadState, saveState } from './state';
 
 export interface UploadResult {
   success: boolean;
@@ -295,10 +295,10 @@ export async function uploadFile(
         // Record successful sync with both hashes
         recordSync(resolved, schemaHash, result.connectionId || null, stats.size);
         // Store content hash for row-change detection (extend state)
-        const state = (await import('./state')).loadState();
+        const state = loadState();
         if (state.files[resolved]) {
           (state.files[resolved] as any).contentHash = contentHash;
-          (await import('./state')).saveState(state);
+          saveState(state);
         }
 
         return {
