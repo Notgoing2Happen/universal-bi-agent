@@ -46,14 +46,45 @@ interface QueryResponse {
 const SAMPLE_ROWS = 10;
 
 /**
- * Parse a CSV file into rows.
+ * Normalize a column name to snake_case lowercase.
+ * This ensures consistency between CSV headers (Sample_Name, Num_Reads),
+ * the Universal Schema concepts (sample.name → sample_name), and
+ * Cube.js field names (sample_name).
+ *
+ * Examples:
+ *   "Sample_Name" → "sample_name"
+ *   "Num_Reads" → "num_reads"
+ *   "Percent_Q30" → "percent_q30"
+ *   "OD_450nm" → "od_450nm"
+ *   "sampleTypeID" → "sample_type_id"
+ *   "firstName" → "first_name"
+ */
+function normalizeColumnName(name: string): string {
+  return name
+    // Insert underscore before uppercase letters that follow lowercase (camelCase → camel_case)
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    // Insert underscore before uppercase followed by lowercase after another uppercase (HTMLParser → html_parser)
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    // Replace spaces and hyphens with underscores
+    .replace(/[\s-]+/g, '_')
+    // Lowercase everything
+    .toLowerCase()
+    // Collapse multiple underscores
+    .replace(/_+/g, '_')
+    // Remove leading/trailing underscores
+    .replace(/^_|_$/g, '');
+}
+
+/**
+ * Parse a CSV file into rows with normalized column names.
  */
 function parseCsvFile(filePath: string): Record<string, unknown>[] {
   const text = fs.readFileSync(filePath, 'utf-8');
   const lines = text.split(/\r?\n/).filter(l => l.trim());
   if (lines.length < 2) return [];
 
-  const headers = parseCsvLine(lines[0]);
+  const rawHeaders = parseCsvLine(lines[0]);
+  const headers = rawHeaders.map(normalizeColumnName);
   const rows: Record<string, unknown>[] = [];
 
   for (let i = 1; i < lines.length; i++) {
@@ -125,14 +156,44 @@ function parseExcelFile(filePath: string): Record<string, unknown>[] {
 }
 
 /**
+ * Normalize all column names in a row set.
+ * Applied after parsing to ensure consistency across CSV, JSON, and Excel.
+ */
+function normalizeRowColumns(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (rows.length === 0) return rows;
+
+  // Build name mapping from first row (avoids re-computing per row)
+  const firstRow = rows[0];
+  const nameMap = new Map<string, string>();
+  for (const key of Object.keys(firstRow)) {
+    nameMap.set(key, normalizeColumnName(key));
+  }
+
+  // If all names are already normalized, skip the remapping
+  const needsNormalization = Array.from(nameMap.entries()).some(([k, v]) => k !== v);
+  if (!needsNormalization) return rows;
+
+  return rows.map(row => {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      normalized[nameMap.get(key) || normalizeColumnName(key)] = value;
+    }
+    return normalized;
+  });
+}
+
+/**
  * Load and parse a file based on extension.
+ * All column names are normalized to snake_case lowercase.
  */
 function loadFileData(filePath: string): Record<string, unknown>[] {
   const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.csv' || ext === '.tsv') return parseCsvFile(filePath);
-  if (ext === '.json') return parseJsonFile(filePath);
-  if (ext === '.xlsx' || ext === '.xls') return parseExcelFile(filePath);
-  throw new Error(`Unsupported file type: ${ext}`);
+  let rows: Record<string, unknown>[];
+  if (ext === '.csv' || ext === '.tsv') rows = parseCsvFile(filePath);
+  else if (ext === '.json') rows = normalizeRowColumns(parseJsonFile(filePath));
+  else if (ext === '.xlsx' || ext === '.xls') rows = normalizeRowColumns(parseExcelFile(filePath));
+  else throw new Error(`Unsupported file type: ${ext}`);
+  return rows;
 }
 
 /**

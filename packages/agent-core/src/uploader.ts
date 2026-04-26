@@ -37,6 +37,20 @@ interface ParsedColumn {
 const SAMPLE_ROWS = 10;
 
 /**
+ * Normalize a column name to snake_case lowercase.
+ * Ensures consistency between source headers and Cube.js field names.
+ */
+function normalizeColumnName(name: string): string {
+  return name
+    .replace(/([a-z])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .replace(/[\s-]+/g, '_')
+    .toLowerCase()
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+}
+
+/**
  * Parse a CSV file and extract schema + sample values.
  */
 function parseCsvSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number } {
@@ -54,13 +68,12 @@ function parseCsvSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: nu
     sampleRows.push(parseCsvLine(lines[i]));
   }
 
-  const columns: ParsedColumn[] = headers.map((name, idx) => {
+  const columns: ParsedColumn[] = headers.map((rawName, idx) => {
+    const name = normalizeColumnName(rawName);
     const samples = sampleRows.map(row => {
       const val = row[idx] ?? '';
-      // Try to parse as number
       const num = Number(val);
       if (val !== '' && !isNaN(num)) return num;
-      // Try boolean
       if (val.toLowerCase() === 'true') return true;
       if (val.toLowerCase() === 'false') return false;
       return val;
@@ -126,8 +139,9 @@ function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: n
   const colNames = new Set<string>();
   rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
 
-  const columns: ParsedColumn[] = Array.from(colNames).map(name => {
-    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[name] ?? null);
+  const columns: ParsedColumn[] = Array.from(colNames).map(rawName => {
+    const name = normalizeColumnName(rawName);
+    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[rawName] ?? null);
     const type = inferType(samples);
     return { name, type, samples };
   });
@@ -154,8 +168,9 @@ function parseExcelSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: 
   const colNames = new Set<string>();
   rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
 
-  const columns: ParsedColumn[] = Array.from(colNames).map(name => {
-    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[name] ?? null);
+  const columns: ParsedColumn[] = Array.from(colNames).map(rawName => {
+    const name = normalizeColumnName(rawName);
+    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[rawName] ?? null);
     const type = inferType(samples);
     return { name, type, samples };
   });
