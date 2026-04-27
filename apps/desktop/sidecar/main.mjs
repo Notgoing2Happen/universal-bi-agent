@@ -285,28 +285,41 @@ async function startQueryPolling() {
         for (const query of queries || []) {
           // Process each query locally
           try {
-            console.error(`[Sidecar] Processing relay query ${query.id} for ${query.filePath}`);
+            // Determine endpoint based on query type
+            const isSequenceRegion = query.extra?.type === 'sequence-region';
+            const endpoint = isSequenceRegion ? 'sequence-region' : 'query';
+            const requestBody = isSequenceRegion
+              ? {
+                  connectionId: query.connectionId,
+                  sampleName: query.extra.sampleName,
+                  start: query.extra.start,
+                  end: query.extra.end,
+                  sequenceColumn: query.extra.sequenceColumn,
+                }
+              : {
+                  connectionId: query.connectionId,
+                  filePath: query.filePath,
+                  columns: query.columns,
+                  filters: query.filters,
+                  limit: query.limit,
+                };
 
-            // Query the local query server
-            const queryRes = await fetch(`http://localhost:${QUERY_SERVER_PORT}/query`, {
+            console.error(`[Sidecar] Processing relay ${endpoint} query ${query.id}`);
+
+            const queryRes = await fetch(`http://localhost:${QUERY_SERVER_PORT}/${endpoint}`, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${config.apiKey}`,
               },
-              body: JSON.stringify({
-                connectionId: query.connectionId,
-                filePath: query.filePath,
-                columns: query.columns,
-                filters: query.filters,
-                limit: query.limit,
-              }),
+              body: JSON.stringify(requestBody),
             });
 
             let resultBody;
             if (queryRes.ok) {
               const result = await queryRes.json();
-              resultBody = { data: result.data || [] };
+              // Sequence region returns the full result; data queries return { data: [] }
+              resultBody = isSequenceRegion ? result : { data: result.data || [] };
             } else {
               resultBody = { error: `Local query failed: ${queryRes.status}` };
             }

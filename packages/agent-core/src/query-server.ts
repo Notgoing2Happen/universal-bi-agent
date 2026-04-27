@@ -329,6 +329,105 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           return;
         }
 
+        if (req.url === '/sequence-region' && req.method === 'POST') {
+          const body = await readBody(req);
+          const params = JSON.parse(body) as {
+            connectionId?: string;
+            filePath?: string;
+            sampleName: string;
+            sequenceColumn?: string;  // Column containing the sequence (default: auto-detect)
+            start?: number;           // Start position (0-based, default: 0)
+            end?: number;             // End position (exclusive, default: 2000)
+            context?: number;         // Extra bases on each side for overlap (default: 100)
+          };
+
+          // Resolve file
+          let filePath = params.filePath;
+          if (!filePath && params.connectionId) {
+            filePath = resolveFilePath(params.connectionId) || '';
+          }
+
+          if (!filePath || !fs.existsSync(filePath)) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'File not found' }));
+            return;
+          }
+
+          const rows = loadFileData(filePath);
+
+          // Find the sample row
+          const sampleNameLower = params.sampleName.toLowerCase();
+          const sampleRow = rows.find(row => {
+            return Object.values(row).some(v =>
+              typeof v === 'string' && v.toLowerCase() === sampleNameLower
+            );
+          });
+
+          if (!sampleRow) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              error: `Sample "${params.sampleName}" not found`,
+              availableSamples: rows.slice(0, 20).map(r => {
+                const nameCol = Object.keys(r).find(k => k.includes('name') || k.includes('sample'));
+                return nameCol ? r[nameCol] : Object.values(r)[0];
+              }),
+            }));
+            return;
+          }
+
+          // Find the sequence column (auto-detect if not specified)
+          let seqColumn = params.sequenceColumn;
+          if (!seqColumn) {
+            // Look for columns with long string values (>100 chars) that look like sequences
+            for (const [key, value] of Object.entries(sampleRow)) {
+              if (typeof value === 'string' && value.length > 100 && /^[ATCGNatcgn\s]+$/.test(value.substring(0, 200))) {
+                seqColumn = key;
+                break;
+              }
+            }
+          }
+
+          if (!seqColumn || !sampleRow[seqColumn]) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              error: 'No sequence column found',
+              columns: Object.keys(sampleRow),
+              hint: 'Specify sequenceColumn parameter or ensure file has a column with DNA sequence data (ATCG characters)',
+            }));
+            return;
+          }
+
+          const fullSequence = String(sampleRow[seqColumn]);
+          const totalLength = fullSequence.length;
+          const contextBases = params.context || 100;
+          const start = Math.max(0, (params.start || 0) - contextBases);
+          const end = Math.min(totalLength, (params.end || 2000) + contextBases);
+          const region = fullSequence.substring(start, end);
+
+          // Include all metadata columns (everything except the sequence itself)
+          const metadata: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(sampleRow)) {
+            if (key !== seqColumn) {
+              metadata[key] = value;
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            sampleName: params.sampleName,
+            sequenceColumn: seqColumn,
+            totalSequenceLength: totalLength,
+            regionStart: start,
+            regionEnd: end,
+            regionLength: region.length,
+            sequence: region,
+            metadata,
+            hasMore: end < totalLength,
+            nextStart: end - contextBases,  // Overlap for continuity
+          }));
+          return;
+        }
+
         if (req.url?.startsWith('/schema/') && req.method === 'GET') {
           const connectionId = req.url.split('/schema/')[1];
           const filePath = resolveFilePath(connectionId);
