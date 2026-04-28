@@ -268,7 +268,7 @@ export default function FolderManager() {
                       {name}
                     </span>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
                     <span style={{ fontSize: 11, color: '#64748b' }}>
                       {f.size > 0 ? (f.size < 1024 * 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${(f.size / (1024 * 1024)).toFixed(1)} MB`) : ''}
                     </span>
@@ -281,6 +281,27 @@ export default function FolderManager() {
                     }}>
                       {f.status}
                     </span>
+                    <button
+                      onClick={async () => {
+                        try {
+                          await call('files.remove', { path: f.path });
+                          setSyncedFiles(prev => prev.filter(sf => sf.path !== f.path));
+                        } catch (err) {
+                          console.error('Failed to remove file:', err);
+                        }
+                      }}
+                      style={{
+                        padding: '2px 8px',
+                        borderRadius: 4,
+                        border: '1px solid #7f1d1d',
+                        background: 'transparent',
+                        color: '#f87171',
+                        fontSize: 11,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Remove
+                    </button>
                   </div>
                 </div>
               );

@@ -211,6 +211,40 @@ registerHandler('sync.importFile', async (params) => {
   return result;
 });
 
+// File management handlers
+registerHandler('files.remove', async (params) => {
+  const path = require('path');
+  const resolved = path.resolve(params.path);
+
+  // Notify server to deactivate the connection
+  const config = loadConfig();
+  if (config.platformUrl && config.apiKey) {
+    try {
+      await fetch(`${config.platformUrl}/api/agent/sync`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName: path.basename(resolved), agentFilePath: resolved, deleted: true }),
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      // Server notification failed — remove locally anyway
+    }
+  }
+
+  // Remove from local state
+  const state = loadState();
+  delete state.files[resolved];
+  saveState(state);
+
+  sendEvent('event.log', {
+    level: 'info',
+    message: `Removed: ${path.basename(resolved)}`,
+    timestamp: new Date().toISOString(),
+  });
+
+  return { ok: true, message: `Removed ${path.basename(resolved)}` };
+});
+
 // Schema handlers
 registerHandler('schema.getConcepts', async () => {
   return getCachedConcepts();

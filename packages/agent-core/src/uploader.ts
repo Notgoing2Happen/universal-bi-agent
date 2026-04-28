@@ -278,6 +278,41 @@ export async function uploadFile(
   const contentChanged = !existing || (existing as any).contentHash !== contentHash;
 
   if (!schemaChanged && !contentChanged) {
+    // Verify the server connection still exists before skipping.
+    // If the user deleted the connection from univintel.com, we need to re-sync.
+    if (existing?.connectionId && config.platformUrl && config.apiKey) {
+      try {
+        const checkRes = await fetch(`${config.platformUrl}/api/agent/health`, {
+          headers: { 'Authorization': `Bearer ${config.apiKey}` },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (checkRes.ok) {
+          // Server is reachable — check if this specific connection exists
+          const syncRes = await fetch(`${config.platformUrl}/api/agent/sync`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fileName, fileType, schemaHash, contentHash, agentFilePath: resolved, columns, rowCount, fileSize: stats.size }),
+            signal: AbortSignal.timeout(10000),
+          });
+          if (syncRes.ok) {
+            const syncData = await syncRes.json();
+            if (syncData.unchanged) {
+              return { success: true, unchanged: true, connectionId: existing.connectionId };
+            }
+            // Connection was recreated or schema changed on server — update local state
+            recordSync(resolved, schemaHash, syncData.connectionId || null, stats.size);
+            const state = loadState();
+            if (state.files[resolved]) {
+              (state.files[resolved] as any).contentHash = contentHash;
+              saveState(state);
+            }
+            return { success: true, unchanged: false, connectionId: syncData.connectionId, isNew: syncData.isNew };
+          }
+        }
+      } catch {
+        // Server unreachable — skip silently, try again next sync
+      }
+    }
     return { success: true, unchanged: true, connectionId: existing?.connectionId || undefined };
   }
 
