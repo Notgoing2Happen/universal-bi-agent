@@ -282,12 +282,44 @@ export default function FolderManager() {
                       {f.status}
                     </span>
                     <button
+                      title="Untrack this file (file stays on disk)"
                       onClick={async () => {
                         try {
                           await call('files.remove', { path: f.path });
                           setSyncedFiles(prev => prev.filter(sf => sf.path !== f.path));
                         } catch (err) {
                           console.error('Failed to remove file:', err);
+                        }
+                      }}
+                      style={{
+                        padding: '2px 8px',
+                        borderRadius: 4,
+                        border: '1px solid #334155',
+                        background: 'transparent',
+                        color: '#94a3b8',
+                        fontSize: 11,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Untrack
+                    </button>
+                    <button
+                      title="Permanently delete the file from disk and untrack it"
+                      onClick={async () => {
+                        const confirmed = window.confirm(
+                          `Permanently delete "${name}" from disk?\n\nThis will:\n• Remove the file from your computer\n• Deactivate the connection on the server\n\nThis cannot be undone.`,
+                        );
+                        if (!confirmed) return;
+                        try {
+                          const result = await call<{ ok: boolean; error?: string }>('files.delete', { path: f.path });
+                          if (result?.ok) {
+                            setSyncedFiles(prev => prev.filter(sf => sf.path !== f.path));
+                          } else if (result?.error) {
+                            window.alert(`Could not delete file: ${result.error}`);
+                          }
+                        } catch (err) {
+                          console.error('Failed to delete file:', err);
+                          window.alert(`Failed to delete: ${err instanceof Error ? err.message : err}`);
                         }
                       }}
                       style={{
@@ -300,7 +332,7 @@ export default function FolderManager() {
                         cursor: 'pointer',
                       }}
                     >
-                      Remove
+                      Delete
                     </button>
                   </div>
                 </div>

@@ -245,6 +245,63 @@ registerHandler('files.remove', async (params) => {
   return { ok: true, message: `Removed ${path.basename(resolved)}` };
 });
 
+// Untrack AND physically delete the file from disk.
+// Use when the user wants to clean up a watcher folder. Server-side
+// connection is also deactivated. The file watcher's own delete event
+// will fire afterward, but state is already cleaned so it's a no-op.
+registerHandler('files.delete', async (params) => {
+  const path = require('path');
+  const fs = require('fs');
+  const resolved = path.resolve(params.path);
+  const baseName = path.basename(resolved);
+
+  // 1. Notify server to deactivate the connection (best-effort)
+  const config = loadConfig();
+  if (config.platformUrl && config.apiKey) {
+    try {
+      await fetch(`${config.platformUrl}/api/agent/sync`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName: baseName, agentFilePath: resolved, deleted: true }),
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      // Server notification failed — proceed with local delete anyway
+    }
+  }
+
+  // 2. Remove from local tracking state (do this BEFORE unlink so the
+  // watcher's delete event can't race a re-sync attempt)
+  const state = loadState();
+  delete state.files[resolved];
+  saveState(state);
+
+  // 3. Physically delete the file from disk
+  let deleted = false;
+  let deleteError = null;
+  try {
+    if (fs.existsSync(resolved)) {
+      fs.unlinkSync(resolved);
+      deleted = true;
+    }
+  } catch (err) {
+    deleteError = err instanceof Error ? err.message : String(err);
+  }
+
+  sendEvent('event.log', {
+    level: deleteError ? 'error' : 'info',
+    message: deleteError
+      ? `Deleted from agent (file delete failed: ${deleteError}): ${baseName}`
+      : `Deleted: ${baseName}`,
+    timestamp: new Date().toISOString(),
+  });
+
+  if (deleteError) {
+    return { ok: false, error: deleteError, message: `Untracked but couldn't delete file: ${deleteError}` };
+  }
+  return { ok: true, deleted, message: `Deleted ${baseName}` };
+});
+
 // Schema handlers
 registerHandler('schema.getConcepts', async () => {
   return getCachedConcepts();
