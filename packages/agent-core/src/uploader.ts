@@ -150,7 +150,35 @@ function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: n
 }
 
 /**
+ * Find the header row in a 2D array of cell values.
+ * Walks down rows until we hit the first row with ≥2 non-empty cells.
+ * Handles common Excel patterns: blank rows at top, single-cell title/banner,
+ * multi-row preamble (title + subtitle + blank). Returns -1 if none found.
+ */
+function findHeaderRow(rows: Array<Array<unknown>>): number {
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const nonEmpty = row.filter(c => c !== null && c !== undefined && String(c).trim() !== '');
+    if (nonEmpty.length >= 2) return i;
+  }
+  return -1;
+}
+
+/** Sanitize a header cell into a column key. Empty → "column_<idx>". */
+function cleanHeaderName(cell: unknown, idx: number): string {
+  const raw = cell == null ? '' : String(cell).trim();
+  if (!raw) return `column_${idx + 1}`;
+  return normalizeColumnName(raw) || `column_${idx + 1}`;
+}
+
+/**
  * Parse an Excel file and extract schema + sample values.
+ *
+ * Skips banner/title rows at the top of the sheet. XLSX's default
+ * sheet_to_json uses row 1 unconditionally as the header, which produces
+ * __EMPTY-prefixed column names when row 1 is a banner/blank. We instead
+ * read raw rows first, locate the actual header row (first row with ≥2
+ * non-empty cells), and build columns from that.
  */
 function parseExcelSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number; sheets: string[] } {
   const XLSX = require('xlsx');
@@ -159,23 +187,46 @@ function parseExcelSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: 
 
   if (sheets.length === 0) return { columns: [], rowCount: 0, sheets: [] };
 
-  // Parse first sheet
+  // Parse first sheet as raw 2D array (no header inference)
   const sheet = workbook.Sheets[sheets[0]];
-  const rows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(sheet, { defval: null });
+  const rawRows: unknown[][] = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+    raw: false,
+  });
 
-  if (rows.length === 0) return { columns: [], rowCount: 0, sheets };
+  if (rawRows.length === 0) return { columns: [], rowCount: 0, sheets };
 
-  const colNames = new Set<string>();
-  rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
+  // Locate the actual header row (skip banners/blanks)
+  const headerRowIdx = findHeaderRow(rawRows);
+  const effectiveHeaderIdx = headerRowIdx >= 0 ? headerRowIdx : 0;
+  const headerCells = rawRows[effectiveHeaderIdx] || [];
 
-  const columns: ParsedColumn[] = Array.from(colNames).map(rawName => {
-    const name = normalizeColumnName(rawName);
-    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[rawName] ?? null);
+  // Build column names + dedup repeated headers
+  const seen = new Map<string, number>();
+  const columnNames = headerCells.map((c, i) => {
+    const base = cleanHeaderName(c, i);
+    const count = seen.get(base) || 0;
+    seen.set(base, count + 1);
+    return count === 0 ? base : `${base}_${count}`;
+  });
+
+  // Data rows are everything below the header
+  const dataRows = rawRows.slice(effectiveHeaderIdx + 1)
+    .filter(row => Array.isArray(row) && row.some(c => c !== null && c !== undefined && String(c).trim() !== ''));
+
+  if (effectiveHeaderIdx > 0) {
+    console.log(`[parseExcelSchema] Detected header row at index ${effectiveHeaderIdx} (skipped ${effectiveHeaderIdx} banner/blank row(s))`);
+  }
+
+  // Build per-column samples + type inference
+  const columns: ParsedColumn[] = columnNames.map((name, colIdx) => {
+    const samples = dataRows.slice(0, SAMPLE_ROWS).map(row => row[colIdx] ?? null);
     const type = inferType(samples);
     return { name, type, samples };
   });
 
-  return { columns, rowCount: rows.length, sheets };
+  return { columns, rowCount: dataRows.length, sheets };
 }
 
 /**
