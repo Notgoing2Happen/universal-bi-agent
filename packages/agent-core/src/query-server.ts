@@ -145,14 +145,48 @@ function parseJsonFile(filePath: string): Record<string, unknown>[] {
 
 /**
  * Parse an Excel file into rows.
+ *
+ * Multi-sheet workbooks: previously this hardcoded SheetNames[0], which
+ * silently returned an empty/cover sheet for files where the real data
+ * lives on a later tab. The sync-time uploader uses AI #10 to pick the
+ * right sheet, but query-time runs after-the-fact and doesn't have that
+ * decision locally — so we mirror the same intent with a simple
+ * heuristic: pick the sheet with the most populated rows. Ties favor
+ * the first sheet (preserving existing behavior for single-table files).
  */
 function parseExcelFile(filePath: string): Record<string, unknown>[] {
   const XLSX = require('xlsx');
   const buffer = fs.readFileSync(filePath);
   const workbook = XLSX.read(buffer, { type: 'buffer' });
   if (workbook.SheetNames.length === 0) return [];
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  return XLSX.utils.sheet_to_json(sheet, { defval: null });
+
+  let bestSheetName = workbook.SheetNames[0];
+  let bestRowCount = -1;
+  let bestRows: Record<string, unknown>[] = [];
+
+  for (const name of workbook.SheetNames) {
+    const sheet = workbook.Sheets[name];
+    if (!sheet) continue;
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: null }) as Record<string, unknown>[];
+    // Count rows that have at least one non-null/non-empty value. This
+    // discards cover sheets, instructions, banners, etc.
+    const populatedCount = rows.filter(r =>
+      Object.values(r).some(v => v !== null && v !== undefined && String(v).trim() !== '')
+    ).length;
+    if (populatedCount > bestRowCount) {
+      bestRowCount = populatedCount;
+      bestSheetName = name;
+      bestRows = rows;
+    }
+  }
+
+  if (bestSheetName !== workbook.SheetNames[0]) {
+    console.log(
+      `[query-server] Excel "${path.basename(filePath)}": picked sheet "${bestSheetName}" ` +
+      `(${bestRowCount} populated rows) over default first sheet "${workbook.SheetNames[0]}"`,
+    );
+  }
+  return bestRows;
 }
 
 /**
