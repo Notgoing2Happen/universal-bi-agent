@@ -48,6 +48,46 @@ interface TableStructureDecision {
 const SAMPLE_ROWS = 10;
 
 /**
+ * Sample column values for AI #1 mapping. Replaces the original
+ * first-N-rows pattern across CSV/JSON/Excel paths.
+ *
+ * Why: the platform's AI #1 maps columns based on per-column sample values
+ * (column name + samples + table context). The OLD agent behavior took the
+ * first N rows verbatim, which for sparse columns gives mostly null/empty
+ * values. Result: AI #1 sees 1 non-null value and has to make a 40%-
+ * confidence guess based on whatever that 1 value happens to be — and that
+ * value can be unrepresentative or even a row-level data entry error.
+ *
+ * The fix mirrors the web-upload path's `parseFileForMapping` logic in
+ * `packages/connectors/src/local-files/index.ts`:
+ *   1. Gather ALL non-empty values for the column (across the full dataset)
+ *   2. Fisher-Yates shuffle so samples are representative, not the first-N
+ *   3. Take up to N (default 10) samples
+ *
+ * For sparse columns with fewer than N non-empty values total, returns
+ * what's available. The platform's AI #1 already handles low-sample cases
+ * by lowering confidence — getting fewer real samples is still strictly
+ * better than getting N samples polluted with nulls.
+ *
+ * Surfaced 2026-05-30: Global_Health_Lab `location_details` column where
+ * 9 of 10 first-N samples were null and the one populated value
+ * ("CAS: 1129-30-2") was a row-level data error. See platform memory
+ * `project_local_file_sampler_bug.md`.
+ */
+function sampleColumnValues(allValues: unknown[]): unknown[] {
+  const nonEmpty = allValues.filter(
+    (v) => v !== null && v !== undefined && String(v).trim() !== '',
+  );
+  // Fisher-Yates shuffle in place on a copy
+  const shuffled = [...nonEmpty];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, SAMPLE_ROWS);
+}
+
+/**
  * Ask the platform's AI #10 endpoint to decide how to parse this tabular
  * file: which sheet (Excel), which header row, which delimiter (CSV-family).
  *
@@ -186,9 +226,9 @@ function parseCsvSchema(
     dataEndRowIdx === null ? lines.length : Math.min(lines.length, dataEndRowIdx + 1),
   );
 
-  const sampleRows: string[][] = dataLines
-    .slice(0, SAMPLE_ROWS)
-    .map(l => splitByDelimiter(l, delimiter));
+  // Parse ALL data rows (not just first N) so we can sample
+  // per-column non-empty values for representative AI #1 mapping.
+  const allParsedRows: string[][] = dataLines.map((l) => splitByDelimiter(l, delimiter));
 
   // Dedup repeated header names so duplicates don't collide silently
   const seen = new Map<string, number>();
@@ -200,7 +240,8 @@ function parseCsvSchema(
   });
 
   const columns: ParsedColumn[] = finalNames.map((name, idx) => {
-    const samples = sampleRows.map(row => coerceValue(row[idx] ?? ''));
+    const allValues = allParsedRows.map((row) => coerceValue(row[idx] ?? ''));
+    const samples = sampleColumnValues(allValues);
     const type = inferType(samples);
     return { name, type, samples };
   });
@@ -262,7 +303,8 @@ function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: n
 
   const columns: ParsedColumn[] = Array.from(colNames).map(rawName => {
     const name = normalizeColumnName(rawName);
-    const samples = rows.slice(0, SAMPLE_ROWS).map(row => row[rawName] ?? null);
+    const allValues = rows.map((row) => row[rawName] ?? null);
+    const samples = sampleColumnValues(allValues);
     const type = inferType(samples);
     return { name, type, samples };
   });
@@ -380,7 +422,8 @@ function parseExcelSchema(
       .filter(row => Array.isArray(row) && row.some(c => c !== null && c !== undefined && String(c).trim() !== ''));
 
     const columns: ParsedColumn[] = columnNames.map((name, colIdx) => {
-      const samples = dataRows.slice(0, SAMPLE_ROWS).map(row => row[colIdx] ?? null);
+      const allValues = dataRows.map((row) => row[colIdx] ?? null);
+      const samples = sampleColumnValues(allValues);
       return { name, type: inferType(samples), samples };
     });
 
@@ -418,7 +461,8 @@ function parseExcelSchema(
     });
     const dataRows = rows.slice(1).filter(r => Array.isArray(r) && r.some(c => c !== null && c !== undefined && String(c).trim() !== ''));
     const columns: ParsedColumn[] = columnNames.map((name, colIdx) => {
-      const samples = dataRows.slice(0, SAMPLE_ROWS).map(row => row[colIdx] ?? null);
+      const allValues = dataRows.map((row) => row[colIdx] ?? null);
+      const samples = sampleColumnValues(allValues);
       return { name, type: inferType(samples), samples };
     });
     console.log(`[parseExcelSchema/fallback] No clear tabular sheet; using first sheet "${fallbackSheet}" row 0`);
@@ -443,7 +487,8 @@ function parseExcelSchema(
   console.log(`[parseExcelSchema/fallback] AI unavailable; heuristic picked "${best.name}", header row ${effectiveHeaderIdx}; ${columnNames.length} columns, ${dataRows.length} data rows`);
 
   const columns: ParsedColumn[] = columnNames.map((name, colIdx) => {
-    const samples = dataRows.slice(0, SAMPLE_ROWS).map(row => row[colIdx] ?? null);
+    const allValues = dataRows.map((row) => row[colIdx] ?? null);
+    const samples = sampleColumnValues(allValues);
     return { name, type: inferType(samples), samples };
   });
 
