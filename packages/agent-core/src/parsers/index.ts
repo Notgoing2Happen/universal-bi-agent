@@ -18,3 +18,7 @@ export {
   parseCsvFileBuffered,
   type StreamCsvOptions,
 } from './stream-csv';
+export {
+  streamJsonRows,
+  parseJsonFileBuffered,
+} from './stream-json';

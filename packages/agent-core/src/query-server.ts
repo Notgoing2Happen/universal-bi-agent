@@ -23,7 +23,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
-import { normalizeColumnName, parseCsvLine, parseCsvFileBuffered } from './parsers';
+import {
+  normalizeColumnName,
+  parseCsvLine,
+  parseCsvFileBuffered,
+  parseJsonFileBuffered,
+} from './parsers';
 
 // Phase 0 (2026-06-07): file-size cap to prevent silent OOM crashes when
 // the sidecar tries to read a file larger than its heap budget. Reads
@@ -149,16 +154,29 @@ async function parseCsvFile(filePath: string): Promise<Record<string, unknown>[]
 
 /**
  * Parse a JSON file into rows.
+ *
+ * Phase 1 (2026-06-07, SCOPE.md): swapped from a single fs.readFileSync +
+ * JSON.parse to a streaming stream-json pipeline. Shape sniffer peeks the
+ * first 16KB to decide:
+ *   - root [...]               → stream array elements
+ *   - root { data: [...], ... } (or items/rows/results/records/value)
+ *                              → stream the array under that key
+ *   - root { ... no array }    → fall back to buffered JSON.parse + [parsed]
+ *                                (preserves legacy parity; the consumer
+ *                                needs the whole object regardless)
+ *   - root scalar              → []
+ *
+ * Memory profile for row-bearing JSON files: peak ≈ size of the final rows
+ * array (no more 2-3× multiplier from UTF-8 string + parsed graph +
+ * extracted array). For a 50MB { data: [...] } file with 1KB rows, peak
+ * drops from ~150MB to ~50MB.
+ *
+ * Return shape preserved: still Record<string,unknown>[]. The
+ * normalizeRowColumns() wrapper around this call in loadFileData()
+ * continues to apply column-name normalization on the result.
  */
-function parseJsonFile(filePath: string): Record<string, unknown>[] {
-  const text = fs.readFileSync(filePath, 'utf-8');
-  const parsed = JSON.parse(text);
-  if (Array.isArray(parsed)) return parsed;
-  if (typeof parsed === 'object' && parsed !== null) {
-    const arrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-    return arrayKey ? parsed[arrayKey] : [parsed];
-  }
-  return [];
+async function parseJsonFile(filePath: string): Promise<Record<string, unknown>[]> {
+  return parseJsonFileBuffered(filePath);
 }
 
 /**
@@ -247,7 +265,7 @@ async function loadFileData(filePath: string): Promise<Record<string, unknown>[]
   const ext = path.extname(filePath).toLowerCase();
   let rows: Record<string, unknown>[];
   if (ext === '.csv' || ext === '.tsv') rows = await parseCsvFile(filePath);
-  else if (ext === '.json') rows = normalizeRowColumns(parseJsonFile(filePath));
+  else if (ext === '.json') rows = normalizeRowColumns(await parseJsonFile(filePath));
   else if (ext === '.xlsx' || ext === '.xls') rows = normalizeRowColumns(parseExcelFile(filePath));
   else throw new Error(`Unsupported file type: ${ext}`);
   return rows;
