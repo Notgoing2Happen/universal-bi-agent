@@ -19,6 +19,9 @@
   },
   "dependencies": {
     "chokidar": "^3.6.0",
+    "csv-parse": "^6.2.1",
+    "stream-chain": "^4.2.2",
+    "stream-json": "^3.3.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

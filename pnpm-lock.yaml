@@ -75,6 +75,15 @@ importers:
       chokidar:
         specifier: ^3.6.0
         version: 3.6.0
+      csv-parse:
+        specifier: ^6.2.1
+        version: 6.2.1
+      stream-chain:
+        specifier: ^4.2.2
+        version: 4.2.3
+      stream-json:
+        specifier: ^3.3.0
+        version: 3.3.0
       xlsx:
         specifier: ^0.18.5
         version: 0.18.5
@@ -808,6 +817,9 @@ packages:
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
 
+  csv-parse@6.2.1:
+    resolution: {integrity: sha512-LRLMV+UCyfMokp8Wb411duBf1gaBKJfOfBWU9eHMJ+b+cJYZsNu3AFmjJf3+yPGd59Exz1TsMjaSFyxnYB9+IQ==}
+
   debug@4.4.3:
     resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
     engines: {node: '>=6.0'}
@@ -971,6 +983,14 @@ packages:
   ssf@0.11.2:
     resolution: {integrity: sha512-+idbmIXoYET47hH+d7dfm2epdOMUDjqcB4648sTZ+t2JwoyBFL/insLfB/racrDmsKB3diwsDA696pZMieAC5g==}
     engines: {node: '>=0.8'}
+
+  stream-chain@4.2.3:
+    resolution: {integrity: sha512-xxKWXFi9GsqKIpd6Grq0kvx+40DsQLWaQpHpS3oLca/3vkTVjUKd/PT5LmAskFGdjh69JjqV9+Cjxq8VxUpUxQ==}
+    engines: {node: '>=22'}
+
+  stream-json@3.3.0:
+    resolution: {integrity: sha512-9sy7l2iw7XKB30SyoxxbPRh1PGL0kZU351f6JYdEEmLGwLM1wtcJ3mZPfOZrFk8JTS7wqUzwD/DW9evWVqUNTQ==}
+    engines: {node: '>=22'}
 
   to-regex-range@5.0.1:
     resolution: {integrity: sha512-65P7iz6X5yEr1cwcgvQxbbIw7Uk3gOy5dIdtZ4rDveLqhrdJP+Li/Hx6tyK0NEb+2GCyneCMJiGqrADCSNk8sQ==}
@@ -1575,6 +1595,8 @@ snapshots:
 
   csstype@3.2.3: {}
 
+  csv-parse@6.2.1: {}
+
   debug@4.4.3:
     dependencies:
       ms: 2.1.3
@@ -1771,6 +1793,12 @@ snapshots:
   ssf@0.11.2:
     dependencies:
       frac: 1.1.2
+
+  stream-chain@4.2.3: {}
+
+  stream-json@3.3.0:
+    dependencies:
+      stream-chain: 4.2.3
 
   to-regex-range@5.0.1:
     dependencies:

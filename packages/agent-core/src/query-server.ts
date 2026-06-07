@@ -23,6 +23,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
+import { normalizeColumnName, parseCsvLine } from './parsers';
 
 // Phase 0 (2026-06-07): file-size cap to prevent silent OOM crashes when
 // the sidecar tries to read a file larger than its heap budget. Reads
@@ -102,22 +103,6 @@ const SAMPLE_ROWS = 10;
  *   "sampleTypeID" → "sample_type_id"
  *   "firstName" → "first_name"
  */
-function normalizeColumnName(name: string): string {
-  return name
-    // Insert underscore before uppercase letters that follow lowercase (camelCase → camel_case)
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    // Insert underscore before uppercase followed by lowercase after another uppercase (HTMLParser → html_parser)
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-    // Replace spaces and hyphens with underscores
-    .replace(/[\s-]+/g, '_')
-    // Lowercase everything
-    .toLowerCase()
-    // Collapse multiple underscores
-    .replace(/_+/g, '_')
-    // Remove leading/trailing underscores
-    .replace(/^_|_$/g, '');
-}
-
 /**
  * Parse a CSV file into rows with normalized column names.
  */
@@ -150,26 +135,6 @@ function parseCsvFile(filePath: string): Record<string, unknown>[] {
   }
 
   return rows;
-}
-
-function parseCsvLine(line: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-      else { inQuotes = !inQuotes; }
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  result.push(current.trim());
-  return result;
 }
 
 /**

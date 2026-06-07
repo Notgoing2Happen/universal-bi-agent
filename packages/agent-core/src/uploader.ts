@@ -18,6 +18,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { AgentConfig } from './config';
 import { recordSync, getFileState, removeFileState, loadState, saveState } from './state';
+import { normalizeColumnName, parseCsvLine } from './parsers';
 
 export interface UploadResult {
   success: boolean;
@@ -182,20 +183,6 @@ function splitByDelimiter(line: string, delim: string): string[] {
 }
 
 /**
- * Normalize a column name to snake_case lowercase.
- * Ensures consistency between source headers and Cube.js field names.
- */
-function normalizeColumnName(name: string): string {
-  return name
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-    .replace(/[\s-]+/g, '_')
-    .toLowerCase()
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
-}
-
-/**
  * Parse a CSV file and extract schema + sample values.
  *
  * When `decision` is provided (from AI #10), uses its delimiter, header
@@ -247,34 +234,6 @@ function parseCsvSchema(
   });
 
   return { columns, rowCount: dataLines.length };
-}
-
-/**
- * Parse a single CSV line handling quoted fields.
- */
-function parseCsvLine(line: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  result.push(current.trim());
-  return result;
 }
 
 /**
