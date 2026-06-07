@@ -551,6 +551,23 @@ export async function uploadFile(
     return { success: false, error: `Unsupported file type: ${fileName}` };
   }
 
+  // Phase 0 (2026-06-07): refuse oversized files BEFORE the full bulk read.
+  // Pre-fix: fs.readFileSync allocates ~fileSize bytes synchronously; on a
+  // ~500MB file the V8 heap (default ~1.5GB) is pinned for the entire upload
+  // and a 1GB+ file simply OOM-kills the sidecar with no user-facing error.
+  // Post-fix: structured error returned to the platform; user sees a clear
+  // "file too large" message with the actual cap, not a silent timeout.
+  const fileSizeLimit = config?.maxFileSize ?? 50 * 1024 * 1024;
+  if (stats.size > fileSizeLimit) {
+    return {
+      success: false,
+      error:
+        `File "${fileName}" is ${(stats.size / 1024 / 1024).toFixed(1)}MB, ` +
+        `exceeds the agent's ${(fileSizeLimit / 1024 / 1024).toFixed(0)}MB limit. ` +
+        `Increase maxFileSize in ~/.universal-bi/config.json or split the file.`,
+    };
+  }
+
   // Read and parse the file locally
   const buffer = fs.readFileSync(resolved);
 

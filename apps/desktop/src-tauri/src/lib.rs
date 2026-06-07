@@ -166,8 +166,17 @@ pub fn run() {
             eprintln!("[Tauri] Starting sidecar: {:?}", sidecar_path);
 
             // Spawn sidecar with stdio pipes for JSON-RPC
+            //
+            // Phase 0 (2026-06-07): raise V8 heap from the default ~1.5GB to 2GB
+            // so large file reads (50MB cap × parsing overhead ≈ 200-400MB resident
+            // peak for Excel / nested-JSON) don't OOM-kill the sidecar mid-upload.
+            // SCOPE.md Phase 0 rationale: a 50MB Excel parses to ~800MB of in-memory
+            // workbook objects; the historical default heap silently OOM'd around
+            // 30-40MB Excel files. 2048MB gives ~5× headroom under the 50MB cap
+            // and is well under any reasonable user's available system RAM.
             let mut cmd = Command::new(&sidecar_path);
             cmd.env("NODE_ENV", "production")
+                .env("NODE_OPTIONS", "--max-old-space-size=2048")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());

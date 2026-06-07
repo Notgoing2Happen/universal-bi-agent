@@ -24,6 +24,49 @@ import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
 
+// Phase 0 (2026-06-07): file-size cap to prevent silent OOM crashes when
+// the sidecar tries to read a file larger than its heap budget. Reads
+// loadConfig().maxFileSize (default 50MB) — the same setting the uploader
+// uses. Falls back to 50MB if config isn't loaded yet (e.g. health check).
+function getMaxFileSize(): number {
+  const cfg = loadConfig();
+  return cfg?.maxFileSize ?? 50 * 1024 * 1024;
+}
+
+/**
+ * Phase 0 (2026-06-07): structured error for file-size violations.
+ * Platform catches this and surfaces a clear message to the user instead
+ * of timing out after the agent silently OOM-crashes.
+ */
+class FileTooLargeError extends Error {
+  readonly statusCode = 413;
+  readonly fileSize: number;
+  readonly limit: number;
+  constructor(filePath: string, fileSize: number, limit: number) {
+    super(
+      `File "${path.basename(filePath)}" is ${(fileSize / 1024 / 1024).toFixed(1)}MB, ` +
+      `exceeds the agent's ${(limit / 1024 / 1024).toFixed(0)}MB limit. ` +
+      `Increase maxFileSize in ~/.universal-bi/config.json or split the file.`,
+    );
+    this.name = 'FileTooLargeError';
+    this.fileSize = fileSize;
+    this.limit = limit;
+  }
+}
+
+/**
+ * Phase 0 (2026-06-07): wraps fs.statSync + size enforcement before any
+ * read. Returns nothing on success; throws FileTooLargeError on violation.
+ * Use at the entry of every code path that's about to fs.readFileSync.
+ */
+function enforceFileSizeCap(filePath: string): void {
+  const stats = fs.statSync(filePath);
+  const limit = getMaxFileSize();
+  if (stats.size > limit) {
+    throw new FileTooLargeError(filePath, stats.size, limit);
+  }
+}
+
 interface QueryRequest {
   connectionId: string;
   filePath: string;
@@ -219,8 +262,13 @@ function normalizeRowColumns(rows: Record<string, unknown>[]): Record<string, un
 /**
  * Load and parse a file based on extension.
  * All column names are normalized to snake_case lowercase.
+ *
+ * Phase 0 (2026-06-07): size-checked before any read. Throws
+ * FileTooLargeError if the file exceeds the configured maxFileSize cap.
+ * The HTTP handler catches it and returns 413 with a clear message.
  */
 function loadFileData(filePath: string): Record<string, unknown>[] {
+  enforceFileSizeCap(filePath);
   const ext = path.extname(filePath).toLowerCase();
   let rows: Record<string, unknown>[];
   if (ext === '.csv' || ext === '.tsv') rows = parseCsvFile(filePath);
@@ -484,6 +532,28 @@ export function startQueryServer(port: number = 9322): Promise<void> {
         res.end(JSON.stringify({ error: 'Not found' }));
       } catch (err) {
         console.error('[QueryServer] Error:', err);
+        // Phase 0 (2026-06-07): distinguish structured errors (FileTooLargeError,
+        // RequestTooLargeError) from generic crashes so the platform can
+        // surface a clear user message instead of timing out on a silent OOM.
+        if (err instanceof FileTooLargeError) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: err.message,
+            code: 'FILE_TOO_LARGE',
+            fileSize: err.fileSize,
+            limit: err.limit,
+          }));
+          return;
+        }
+        if (err instanceof RequestTooLargeError) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: err.message,
+            code: 'REQUEST_BODY_TOO_LARGE',
+            limit: err.limit,
+          }));
+          return;
+        }
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Internal error' }));
       }
@@ -511,10 +581,45 @@ export function stopQueryServer(): void {
   }
 }
 
+/**
+ * Phase 0 (2026-06-07): structured error for HTTP body exceeding the cap.
+ */
+class RequestTooLargeError extends Error {
+  readonly statusCode = 413;
+  readonly limit: number;
+  constructor(limit: number) {
+    super(
+      `Request body exceeds the agent's ${(limit / 1024 / 1024).toFixed(0)}MB limit. ` +
+      `Split the request or increase maxFileSize in ~/.universal-bi/config.json.`,
+    );
+    this.name = 'RequestTooLargeError';
+    this.limit = limit;
+  }
+}
+
+/**
+ * Read an HTTP request body into a string.
+ *
+ * Phase 0 (2026-06-07): bounded by the same maxFileSize cap as file reads.
+ * Pre-fix: unbounded — a 1GB POST body would silently exhaust the heap
+ * before any file is even opened. Post-fix: destroys the request and
+ * throws RequestTooLargeError when accumulated bytes pass the cap.
+ */
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
+    const limit = getMaxFileSize();
+    let bytesReceived = 0;
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    req.on('data', (chunk: Buffer | string) => {
+      const chunkSize = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      bytesReceived += chunkSize;
+      if (bytesReceived > limit) {
+        req.destroy();
+        reject(new RequestTooLargeError(limit));
+        return;
+      }
+      body += chunk;
+    });
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
