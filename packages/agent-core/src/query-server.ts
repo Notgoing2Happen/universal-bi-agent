@@ -23,7 +23,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
-import { normalizeColumnName, parseCsvLine } from './parsers';
+import { normalizeColumnName, parseCsvLine, parseCsvFileBuffered } from './parsers';
 
 // Phase 0 (2026-06-07): file-size cap to prevent silent OOM crashes when
 // the sidecar tries to read a file larger than its heap budget. Reads
@@ -105,36 +105,46 @@ const SAMPLE_ROWS = 10;
  */
 /**
  * Parse a CSV file into rows with normalized column names.
+ *
+ * Phase 1 (2026-06-07, SCOPE.md): swapped from
+ *   readFileSync → split('\n') → manual parseCsvLine per line
+ * to a streaming csv-parse pipeline. Behavior gains:
+ *   - UTF-8 BOM stripped (was silently embedded in first header)
+ *   - Multi-line quoted fields parse correctly
+ *   - TSV files use the correct delimiter (was hardcoded ',' regardless)
+ *   - Type coercion preserved (empty/number/bool/string heuristic identical
+ *     to the legacy parser — see parsers/stream-csv.ts legacyCoerce()).
+ *
+ * Phase 1 keeps the materialized-array return shape for caller compatibility
+ * (applyFilters, slice, find all assume an Array). Phase 2 will switch the
+ * downstream pipeline to stream-and-sample.
  */
-function parseCsvFile(filePath: string): Record<string, unknown>[] {
-  const text = fs.readFileSync(filePath, 'utf-8');
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
-  if (lines.length < 2) return [];
+async function parseCsvFile(filePath: string): Promise<Record<string, unknown>[]> {
+  const ext = path.extname(filePath).toLowerCase();
+  const rawRows = await parseCsvFileBuffered(filePath, {
+    delimiter: ext === '.tsv' ? '\t' : undefined,
+  });
+  if (rawRows.length === 0) return [];
 
-  const rawHeaders = parseCsvLine(lines[0]);
-  const headers = rawHeaders.map(normalizeColumnName);
-  const rows: Record<string, unknown>[] = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const values = parseCsvLine(lines[i]);
-    const row: Record<string, unknown> = {};
-    for (let j = 0; j < headers.length; j++) {
-      const val = values[j] ?? '';
-      const num = Number(val);
-      if (val !== '' && !isNaN(num)) {
-        row[headers[j]] = num;
-      } else if (val.toLowerCase() === 'true') {
-        row[headers[j]] = true;
-      } else if (val.toLowerCase() === 'false') {
-        row[headers[j]] = false;
-      } else {
-        row[headers[j]] = val;
-      }
-    }
-    rows.push(row);
+  // csv-parse with `columns: true` emits rows keyed by raw header strings.
+  // The legacy parser normalized headers BEFORE building rows; preserve that
+  // by remapping each row's keys through normalizeColumnName. Build the name
+  // map once from the first row to avoid per-row recomputation.
+  const firstRow = rawRows[0];
+  const nameMap = new Map<string, string>();
+  for (const key of Object.keys(firstRow)) {
+    nameMap.set(key, normalizeColumnName(key));
   }
+  const needsNormalization = Array.from(nameMap.entries()).some(([k, v]) => k !== v);
+  if (!needsNormalization) return rawRows;
 
-  return rows;
+  return rawRows.map((row) => {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      normalized[nameMap.get(key) || normalizeColumnName(key)] = value;
+    }
+    return normalized;
+  });
 }
 
 /**
@@ -232,11 +242,11 @@ function normalizeRowColumns(rows: Record<string, unknown>[]): Record<string, un
  * FileTooLargeError if the file exceeds the configured maxFileSize cap.
  * The HTTP handler catches it and returns 413 with a clear message.
  */
-function loadFileData(filePath: string): Record<string, unknown>[] {
+async function loadFileData(filePath: string): Promise<Record<string, unknown>[]> {
   enforceFileSizeCap(filePath);
   const ext = path.extname(filePath).toLowerCase();
   let rows: Record<string, unknown>[];
-  if (ext === '.csv' || ext === '.tsv') rows = parseCsvFile(filePath);
+  if (ext === '.csv' || ext === '.tsv') rows = await parseCsvFile(filePath);
   else if (ext === '.json') rows = normalizeRowColumns(parseJsonFile(filePath));
   else if (ext === '.xlsx' || ext === '.xls') rows = normalizeRowColumns(parseExcelFile(filePath));
   else throw new Error(`Unsupported file type: ${ext}`);
@@ -346,7 +356,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           }
 
           // Parse file
-          let rows = loadFileData(filePath);
+          let rows = await loadFileData(filePath);
           const totalRows = rows.length;
 
           // Apply filters
@@ -400,7 +410,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          const rows = loadFileData(filePath);
+          const rows = await loadFileData(filePath);
 
           // Find the sample row
           const sampleNameLower = params.sampleName.toLowerCase();
@@ -485,7 +495,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          const rows = loadFileData(filePath);
+          const rows = await loadFileData(filePath);
           const columns = inferColumns(rows);
 
           res.writeHead(200, { 'Content-Type': 'application/json' });

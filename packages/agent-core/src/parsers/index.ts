@@ -13,3 +13,8 @@
 
 export { normalizeColumnName } from './normalize';
 export { parseCsvLine } from './csv-line';
+export {
+  streamCsvRows,
+  parseCsvFileBuffered,
+  type StreamCsvOptions,
+} from './stream-csv';
