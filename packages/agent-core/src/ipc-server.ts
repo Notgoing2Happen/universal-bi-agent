@@ -11,6 +11,7 @@
  */
 
 import * as readline from 'readline';
+import { getAgentVersion } from './version';
 
 export interface IpcRequest {
   jsonrpc: '2.0';
@@ -187,6 +188,8 @@ export function startIpcServer(): void {
     process.exit(0);
   });
 
-  // Signal readiness
-  sendEvent('event.ready', { version: '0.1.0' });
+  // Signal readiness. Phase 1 follow-up (2026-06-07): version no longer
+  // hardcoded — reads from process.env.AGENT_VERSION via the canonical
+  // version.ts helper. See packages/agent-core/src/version.ts.
+  sendEvent('event.ready', { version: getAgentVersion() });
 }

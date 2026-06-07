@@ -9,6 +9,15 @@
  * so the Vite dev server (browser) can communicate without Tauri.
  */
 
+import { AGENT_VERSION } from './version.mjs';
+
+// Phase 1 follow-up (2026-06-07): propagate AGENT_VERSION to the agent-core
+// imports BEFORE they execute. agent-core's query-server.ts (/health) and
+// ipc-server.ts (event.ready) read process.env.AGENT_VERSION via the
+// canonical getAgentVersion() helper. Must be set before the import below
+// touches anything that depends on it. See packages/agent-core/src/version.ts.
+process.env.AGENT_VERSION = AGENT_VERSION;
+
 import { WebSocketServer } from 'ws';
 import {
   startQueryServer,
@@ -331,7 +340,13 @@ startQueryServer(QUERY_SERVER_PORT).then(() => {
       },
       body: JSON.stringify({
         queryServerUrl: `http://localhost:${QUERY_SERVER_PORT}`,
-        agentVersion: '0.1.19',
+        // Phase 1 follow-up (2026-06-07): was hardcoded '0.1.19' from
+        // commit 8855a6f (2026-01-19) and never bumped across 14 releases —
+        // the user's reported "platform shows v0.1.19 forever" bug.
+        // Reads from the canonical sidecar/version.mjs which CI rewrites
+        // from the pushed git tag at build time. Class-shape fix: ONE
+        // version source, every reader imports from it.
+        agentVersion: AGENT_VERSION,
       }),
     }).catch(err => {
       console.error('[Sidecar] Failed to register query server with platform:', err.message);

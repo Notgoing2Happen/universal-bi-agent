@@ -99,3 +99,9 @@ export {
   normalizeColumnName,
   parseCsvLine,
 } from './parsers';
+
+// Version accessor (canonical source of truth — version fix, 2026-06-07)
+export {
+  getAgentVersion,
+  __resetAgentVersionCacheForTests,
+} from './version';

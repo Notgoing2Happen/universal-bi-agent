@@ -29,6 +29,7 @@ import {
   parseCsvFileBuffered,
   parseJsonFileBuffered,
 } from './parsers';
+import { getAgentVersion } from './version';
 
 // Phase 0 (2026-06-07): file-size cap to prevent silent OOM crashes when
 // the sidecar tries to read a file larger than its heap budget. Reads
@@ -352,8 +353,13 @@ export function startQueryServer(port: number = 9322): Promise<void> {
 
       try {
         if (req.url === '/health' && req.method === 'GET') {
+          // Phase 1 follow-up (2026-06-07): version was hardcoded '0.1.0' here
+          // since the agent's first commit — drifted across 33 releases until
+          // someone hit /health and realized the platform was reading a stale
+          // value. Now reads from process.env.AGENT_VERSION (set by the sidecar
+          // before this server starts). Throws if unset — see version.ts.
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok', version: '0.1.0' }));
+          res.end(JSON.stringify({ status: 'ok', version: getAgentVersion() }));
           return;
         }
 

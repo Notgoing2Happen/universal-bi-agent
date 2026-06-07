@@ -102,15 +102,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Update version in tauri.conf.json from the git tag (e.g., v0.1.22 → 0.1.22)
+      # Update version in tauri.conf.json AND sidecar/version.mjs from the git tag
+      # (e.g., v0.1.22 → 0.1.22). The two files MUST stay in lockstep — see
+      # apps/desktop/sidecar/version.mjs for why a separate sidecar version
+      # source exists (SEA-bundled Node sidecar cannot read tauri.conf.json
+      # at runtime). Phase 1 follow-up 2026-06-07: extended this step to also
+      # rewrite version.mjs, closing the drift between bumped tauri.conf.json
+      # and stale agentVersion='0.1.19' in main.mjs that lasted 14 releases.
       - name: Set version from tag
         run: |
           TAG="${{ needs.create-release.outputs.tag }}"
           VERSION="${TAG#v}"
           echo "Setting version to $VERSION"
+          # 1. tauri.conf.json (binary installer metadata + Tauri runtime app.getVersion())
           cd apps/desktop/src-tauri
           node -e "const f='tauri.conf.json'; const c=JSON.parse(require('fs').readFileSync(f,'utf8')); c.version='$VERSION'; require('fs').writeFileSync(f, JSON.stringify(c, null, 2)+'\n');"
           cat tauri.conf.json | head -5
+          # 2. sidecar/version.mjs (Node SEA sidecar runtime — /health, /api/agent/register, event.ready)
+          cd ../sidecar
+          node -e "const f='version.mjs'; const src=require('fs').readFileSync(f,'utf8'); const next=src.replace(/AGENT_VERSION\s*=\s*'[^']*'/, \"AGENT_VERSION = '$VERSION'\"); require('fs').writeFileSync(f, next);"
+          tail -2 version.mjs
         shell: bash
 
       - name: Setup pnpm
