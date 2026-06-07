@@ -18,4 +18,4 @@
 // number here, here, and here") regrows the bug on every release.
 // Read from this constant instead.
 
-export const AGENT_VERSION = '0.1.33';
+export const AGENT_VERSION = '0.1.34';
