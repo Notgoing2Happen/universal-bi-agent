@@ -67,7 +67,19 @@ async fn sidecar_rpc(
             stdin.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
             stdin.flush().map_err(|e| e.to_string())?;
 
-            // Read response lines, skipping any notifications (messages without "id")
+            // Read response lines, skipping any notifications (messages without "id").
+            //
+            // Phase 3b (2026-06-08): chunked-response handling. When the sidecar
+            // serializes a response result whose JSON > IPC_CHUNK_THRESHOLD_BYTES
+            // (default 1MB), it sends a HEADER with `result._chunked: true,
+            // chunkId, totalChunks, totalBytes` followed by N `chunk.frame`
+            // notifications (no id). We reassemble inline here so the caller
+            // gets a single resolved result.
+            //
+            // The sidecar emits header + frames CONTIGUOUSLY (no other
+            // RPC's frames interleave) so we can switch into "collecting
+            // chunks" mode as soon as we see the header and stay there
+            // until done.
             loop {
                 let mut response_line = String::new();
                 match reader.read_line(&mut response_line) {
@@ -100,7 +112,107 @@ async fn sidecar_rpc(
                     return Err(error.to_string());
                 }
 
-                return Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                let result = response.get("result").cloned().unwrap_or(serde_json::Value::Null);
+
+                // Phase 3b: chunked-response handling. If the header signals
+                // _chunked, read N chunk.frame notifications + reassemble.
+                if let Some(chunked_flag) = result.get("_chunked") {
+                    if chunked_flag.as_bool() == Some(true) {
+                        let chunk_id = result
+                            .get("chunkId")
+                            .and_then(|v| v.as_str())
+                            .ok_or("Chunked response missing chunkId")?
+                            .to_string();
+                        let total_chunks = result
+                            .get("totalChunks")
+                            .and_then(|v| v.as_u64())
+                            .ok_or("Chunked response missing totalChunks")? as usize;
+                        let total_bytes = result
+                            .get("totalBytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+
+                        // Pre-allocate buffer to expected size. Frames append
+                        // their data slices in order; final reassembled string
+                        // is parsed once at the end.
+                        let mut buf = String::with_capacity(total_bytes);
+                        let mut received_frames = 0usize;
+
+                        while received_frames < total_chunks {
+                            let mut frame_line = String::new();
+                            match reader.read_line(&mut frame_line) {
+                                Ok(0) => {
+                                    return Err(format!(
+                                        "Sidecar closed connection during chunked transfer (chunkId={}, {}/{} frames)",
+                                        chunk_id, received_frames, total_chunks
+                                    ));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    return Err(format!("Read error during chunked transfer: {}", e));
+                                }
+                            }
+                            let frame_trimmed = frame_line.trim();
+                            if frame_trimmed.is_empty() {
+                                continue;
+                            }
+                            let frame: serde_json::Value =
+                                serde_json::from_str(frame_trimmed).map_err(|e| {
+                                    format!(
+                                        "Invalid JSON in chunk frame: {} (raw: {:?})",
+                                        e, frame_trimmed
+                                    )
+                                })?;
+                            // Only accept chunk.frame notifications matching our
+                            // chunkId. Anything else (event.fileChanged etc.)
+                            // mid-transfer is skipped — sidecar contract says
+                            // chunks ship contiguously, but log unexpected
+                            // interleaves for debugging.
+                            let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                            if method != "chunk.frame" {
+                                eprintln!(
+                                    "[Tauri] Unexpected non-chunk message mid-chunked-transfer (chunkId={}): {}",
+                                    chunk_id, frame_trimmed
+                                );
+                                continue;
+                            }
+                            let params = frame.get("params").ok_or("chunk.frame missing params")?;
+                            let frame_chunk_id = params
+                                .get("chunkId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if frame_chunk_id != chunk_id {
+                                eprintln!(
+                                    "[Tauri] chunk.frame for wrong chunkId (expected {}, got {})",
+                                    chunk_id, frame_chunk_id
+                                );
+                                continue;
+                            }
+                            let data = params
+                                .get("data")
+                                .and_then(|v| v.as_str())
+                                .ok_or("chunk.frame missing data")?;
+                            buf.push_str(data);
+                            received_frames += 1;
+                        }
+
+                        // Reassemble — parse the concatenated payload as the
+                        // ORIGINAL result JSON. Caller sees a normal result,
+                        // no awareness of the chunking transport.
+                        let reassembled: serde_json::Value =
+                            serde_json::from_str(&buf).map_err(|e| {
+                                format!(
+                                    "Failed to parse reassembled chunked response (chunkId={}, bytes={}): {}",
+                                    chunk_id,
+                                    buf.len(),
+                                    e
+                                )
+                            })?;
+                        return Ok(reassembled);
+                    }
+                }
+
+                return Ok(result);
             }
         })();
         let _ = tx.send(result);

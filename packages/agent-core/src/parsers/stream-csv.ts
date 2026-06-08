@@ -53,6 +53,26 @@ export interface StreamCsvOptions {
    * too low for the platform's known compound-text columns).
    */
   maxRecordSize?: number;
+  /**
+   * Phase 2b (2026-06-08): start parsing from this 1-indexed line. Used by the
+   * uploader's schema-extraction path to skip preamble rows when AI #10
+   * decided the header is NOT at line 1. The line at `fromLine` becomes the
+   * HEADER (because the parser is built with `columns: true`). Data rows
+   * begin at `fromLine + 1`.
+   *
+   * Example: AI #10 sees an Excel-exported CSV with 4 cover-page rows then
+   * a real header at row 5. Caller passes `fromLine: 5`; csv-parse skips
+   * rows 1-4, uses row 5 as the header, yields rows 6..N as data.
+   *
+   * Default: 1 (header at first non-empty line — legacy behavior).
+   */
+  fromLine?: number;
+  /**
+   * Phase 2b (2026-06-08): stop parsing AT this 1-indexed line. Used by the
+   * uploader's schema-extraction path to skip footer rows. Default: parse
+   * to EOF.
+   */
+  toLine?: number;
 }
 
 /**
@@ -86,6 +106,12 @@ function buildParser(opts: StreamCsvOptions): Parser {
     relax_quotes: true,
     trim: true,
     max_record_size: opts.maxRecordSize ?? 1_000_000,
+    // Phase 2b: pass through from_line / to_line for preamble + footer
+    // handling. csv-parse treats `from_line` as the new "header line" when
+    // columns:true, so callers should pass fromLine = headerRowIdx + 1
+    // (1-indexed) when AI #10 says the header isn't at line 1.
+    ...(opts.fromLine !== undefined ? { from_line: opts.fromLine } : {}),
+    ...(opts.toLine !== undefined ? { to_line: opts.toLine } : {}),
     cast: coerce
       ? (value: string, ctx: { header: boolean }) => (ctx.header ? value : legacyCoerce(value))
       : false,

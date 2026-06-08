@@ -76,6 +76,29 @@ const handlers = new Map<string, IpcHandler>();
 const IPC_MAX_RESPONSE_BYTES = Number(process.env.IPC_MAX_RESPONSE_BYTES) || 8 * 1024 * 1024;
 
 /**
+ * Phase 3b (2026-06-08): chunking threshold. Responses whose serialized
+ * JSON exceeds this size are split into N frames + sent contiguously
+ * (header + frames). The receiving Tauri side reassembles. Smaller
+ * responses ship as a single line (the legacy path) — no overhead for
+ * the common case.
+ *
+ * Default 1MB. Tunable via IPC_CHUNK_THRESHOLD_BYTES. Set to a value
+ * ≥ IPC_MAX_RESPONSE_BYTES to disable chunking (responses still get
+ * capped at MAX, never silently dropped).
+ *
+ * The chunk frame size is the same as the threshold — N chunks each
+ * carry threshold-many bytes (except possibly the last, which is
+ * smaller). This bounds Tauri's reader memory at threshold per frame.
+ */
+const IPC_CHUNK_THRESHOLD_BYTES = Number(process.env.IPC_CHUNK_THRESHOLD_BYTES) || 1 * 1024 * 1024;
+
+let chunkSeqCounter = 0;
+function nextChunkId(): string {
+  chunkSeqCounter = (chunkSeqCounter + 1) >>> 0;
+  return `chunk-${Date.now()}-${chunkSeqCounter}`;
+}
+
+/**
  * Phase 3a: drain-aware stdout writes. `process.stdout.write()` returns
  * `false` when the OS pipe buffer is full. Without awaiting drain, the
  * caller continues issuing writes and Node buffers them in-process
@@ -171,10 +194,75 @@ function serializeWithSizeCap(
  * Send a JSON-RPC response to stdout.
  *
  * Phase 3a: routes through size-cap + drain-aware write helpers.
+ *
+ * Phase 3b (2026-06-08): chunks oversized responses. If the serialized
+ * response exceeds IPC_CHUNK_THRESHOLD_BYTES (default 1MB) but stays
+ * under IPC_MAX_RESPONSE_BYTES, splits into N frames:
+ *   1. A header response: `{ jsonrpc:'2.0', id, result: { _chunked:true,
+ *      chunkId, totalChunks, totalBytes } }`
+ *   2. N chunk notifications: `{ jsonrpc:'2.0', method:'chunk.frame',
+ *      params: { chunkId, seq, data, done? } }`
+ * Frames are emitted CONTIGUOUSLY through writeWithBackpressure, so the
+ * receiver sees all of them in order before any other RPC interleaves.
+ *
+ * Tauri side handles the contract: when it sees `result._chunked === true`,
+ * it switches to chunk-collection mode + reads frames until done.
  */
 function sendResponse(response: IpcResponse): void {
-  const line = serializeWithSizeCap(response, `response id=${response.id}`);
-  writeWithBackpressure(line);
+  // Errors and notifications don't get chunked — they're tiny by design.
+  if (response.error || !response.result) {
+    const line = serializeWithSizeCap(response, `response id=${response.id}`);
+    writeWithBackpressure(line);
+    return;
+  }
+  // Try to serialize the whole result. If under threshold, ship as one
+  // line (legacy path — zero chunking overhead).
+  const resultJson = JSON.stringify(response.result);
+  if (resultJson.length <= IPC_CHUNK_THRESHOLD_BYTES) {
+    const line = serializeWithSizeCap(response, `response id=${response.id}`);
+    writeWithBackpressure(line);
+    return;
+  }
+  // Over threshold AND under cap → chunk. (Over cap = serializeWithSizeCap
+  // would substitute an error; check that separately.)
+  if (resultJson.length > IPC_MAX_RESPONSE_BYTES) {
+    // Still over cap — substitute the error via serializeWithSizeCap path.
+    const line = serializeWithSizeCap(response, `response id=${response.id}`);
+    writeWithBackpressure(line);
+    return;
+  }
+  // Build chunk plan.
+  const chunkId = nextChunkId();
+  const totalBytes = resultJson.length;
+  const chunkSize = IPC_CHUNK_THRESHOLD_BYTES;
+  const totalChunks = Math.ceil(totalBytes / chunkSize);
+  // Emit header response — carries the original `id` so the receiver knows
+  // which RPC this belongs to.
+  const headerResp: IpcResponse = {
+    jsonrpc: '2.0',
+    id: response.id,
+    result: {
+      _chunked: true,
+      chunkId,
+      totalChunks,
+      totalBytes,
+    },
+  };
+  writeWithBackpressure(JSON.stringify(headerResp) + '\n');
+  // Emit N chunk frames as notifications (no id — they're not standalone
+  // RPC responses, they're parts of the prior header's payload).
+  for (let seq = 0; seq < totalChunks; seq++) {
+    const start = seq * chunkSize;
+    const end = Math.min(start + chunkSize, totalBytes);
+    const data = resultJson.slice(start, end);
+    const done = seq === totalChunks - 1;
+    const frame: IpcNotification = {
+      jsonrpc: '2.0',
+      method: 'chunk.frame',
+      params: { chunkId, seq, data, ...(done ? { done: true } : {}) },
+    };
+    writeWithBackpressure(JSON.stringify(frame) + '\n');
+  }
 }
 
 /**
