@@ -71,14 +71,20 @@ let cachedModules: StreamJsonModules | null = null;
 function loadModules(): StreamJsonModules {
   if (cachedModules) return cachedModules;
 
+  // stream-json 3.3.0's package.json `exports` field declares `"./*": "./src/*"`.
+  // esbuild needs the `.js` suffix explicitly because the exports map doesn't
+  // add it for us — without `.js`, the bundler errors at build time with
+  // "Could not resolve". With it, the require resolves to the actual file at
+  // node_modules/stream-json/src/streamers/stream-array.js. Confirmed during
+  // CI build failure for v0.1.34 (esbuild 0.27.4 in the sidecar SEA bundle).
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const streamChainMod = require('stream-chain');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const streamJsonMod = require('stream-json');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const streamArrayMod = require('stream-json/streamers/stream-array');
+  const streamArrayMod = require('stream-json/streamers/stream-array.js');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const pickMod = require('stream-json/filters/pick');
+  const pickMod = require('stream-json/filters/pick.js');
 
   const chain = streamChainMod.chain ?? streamChainMod.default?.chain ?? streamChainMod;
   const parser = streamJsonMod.parser ?? streamJsonMod.default?.parser ?? streamJsonMod;
