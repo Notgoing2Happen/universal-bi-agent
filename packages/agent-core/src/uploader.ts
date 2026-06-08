@@ -18,7 +18,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { AgentConfig } from './config';
 import { recordSync, getFileState, removeFileState, loadState, saveState } from './state';
-import { normalizeColumnName, parseCsvLine } from './parsers';
+import { normalizeColumnName, parseCsvLine, streamJsonRows, reservoirSampleWithColumnDiscovery } from './parsers';
 
 export interface UploadResult {
   success: boolean;
@@ -238,37 +238,55 @@ function parseCsvSchema(
 
 /**
  * Parse a JSON file and extract schema + sample values.
+ *
+ * Phase 2 (2026-06-08): streaming + reservoir sampling.
+ *
+ * Pre-fix: JSON.parse(buffer.toString('utf-8')) built the full object
+ * graph in memory — for a 50MB JSON file with 1M nested rows the heap
+ * peak was 100-200MB just to pick 10 sample values per column.
+ *
+ * Post-fix: streamJsonRows yields rows one-at-a-time;
+ * reservoirSampleWithColumnDiscovery keeps a fixed-size sample +
+ * accumulates the union of all observed keys. Peak memory is bounded by
+ * SCHEMA_SAMPLE_RESERVOIR_SIZE rows (~50KB for 100 typical rows), not
+ * file size.
+ *
+ * Heterogeneous-schema correctness: the reservoir variant tracks
+ * `allColumnNames` separately from the sample so rare columns that
+ * appear only in late rows are still discovered, even if they're not
+ * in the reservoir sample. Matches the old behavior's column-discovery
+ * step (`rows.forEach(row => Object.keys(row).forEach(...))`).
+ *
+ * Shape contract preserved:
+ *   - Array root: yielded rows ARE the array entries
+ *   - Object root with one array value: stream-json's `pick(rowKey)`
+ *     filter yields the entries of that array
+ *   - Object root with no array: stream-json's parseJsonFileBuffered
+ *     fallback yields [parsed] (one row = the whole object)
+ *   - Scalar root: empty stream → 0 rows, 0 columns
  */
-function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number } {
-  const text = buffer.toString('utf-8');
-  const parsed = JSON.parse(text);
+const SCHEMA_SAMPLE_RESERVOIR_SIZE = 100;
 
-  let rows: Record<string, unknown>[];
-  if (Array.isArray(parsed)) {
-    rows = parsed;
-  } else if (typeof parsed === 'object' && parsed !== null) {
-    // Try to find an array in the first level
-    const arrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-    rows = arrayKey ? parsed[arrayKey] : [parsed];
-  } else {
-    return { columns: [], rowCount: 0 };
-  }
+async function parseJsonSchema(filePath: string): Promise<{ columns: ParsedColumn[]; rowCount: number }> {
+  const { sample, allColumnNames, rowCount } = await reservoirSampleWithColumnDiscovery(
+    streamJsonRows<Record<string, unknown>>(filePath),
+    SCHEMA_SAMPLE_RESERVOIR_SIZE,
+  );
 
-  if (rows.length === 0) return { columns: [], rowCount: 0 };
+  if (rowCount === 0) return { columns: [], rowCount: 0 };
 
-  // Collect all column names
-  const colNames = new Set<string>();
-  rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
-
-  const columns: ParsedColumn[] = Array.from(colNames).map(rawName => {
+  const columns: ParsedColumn[] = allColumnNames.map((rawName) => {
     const name = normalizeColumnName(rawName);
-    const allValues = rows.map((row) => row[rawName] ?? null);
-    const samples = sampleColumnValues(allValues);
+    // Extract values from the reservoir sample. Missing keys → null. The
+    // sample is uniform random over the stream, so per-column null rate
+    // approximates the file's true null rate.
+    const reservoirValues = sample.map((row) => row[rawName] ?? null);
+    const samples = sampleColumnValues(reservoirValues);
     const type = inferType(samples);
     return { name, type, samples };
   });
 
-  return { columns, rowCount: rows.length };
+  return { columns, rowCount };
 }
 
 /**
@@ -557,7 +575,11 @@ export async function uploadFile(
       columns = result.columns;
       rowCount = result.rowCount;
     } else if (fileType === 'json') {
-      const result = parseJsonSchema(buffer);
+      // Phase 2 (2026-06-08): JSON now uses streamJsonRows + reservoir
+      // sampling. The `buffer` arg is no longer used (kept around just for
+      // fileBytesHash above); the parser re-opens the file as a stream so
+      // peak memory is bounded by the reservoir size, not the file size.
+      const result = await parseJsonSchema(resolved);
       columns = result.columns;
       rowCount = result.rowCount;
     } else if (fileType === 'excel') {

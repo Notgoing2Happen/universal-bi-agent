@@ -8,7 +8,11 @@
  * audit explicitly flagged this as a class-shape risk — addressed here by
  * making both paths import from this single module.
  *
- * Phase 2 will extend this module with reservoir-sampling primitives.
+ * Phase 2 (2026-06-08): reservoir-sampling primitives added. The uploader's
+ * JSON schema-extraction path now uses streamJsonRows + reservoirSample
+ * to bound memory by sample size rather than file size. CSV uploader
+ * streaming is a follow-up (needs StreamCsvOptions to gain headerRowIdx /
+ * from_line support).
  */
 
 export { normalizeColumnName } from './normalize';
@@ -22,3 +26,10 @@ export {
   streamJsonRows,
   parseJsonFileBuffered,
 } from './stream-json';
+export {
+  reservoirSample,
+  reservoirSampleWithColumnDiscovery,
+  type ReservoirResult,
+  type ReservoirOptions,
+  type SchemaSamplingResult,
+} from './reservoir';
