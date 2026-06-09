@@ -18,6 +18,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { AgentConfig } from './config';
 import { recordSync, getFileState, removeFileState, loadState, saveState } from './state';
+import { normalizeColumnName, parseCsvLine, streamCsvRows, streamJsonRows, reservoirSampleWithColumnDiscovery } from './parsers';
 
 export interface UploadResult {
   success: boolean;
@@ -182,134 +183,144 @@ function splitByDelimiter(line: string, delim: string): string[] {
 }
 
 /**
- * Normalize a column name to snake_case lowercase.
- * Ensures consistency between source headers and Cube.js field names.
- */
-function normalizeColumnName(name: string): string {
-  return name
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-    .replace(/[\s-]+/g, '_')
-    .toLowerCase()
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
-}
-
-/**
  * Parse a CSV file and extract schema + sample values.
  *
  * When `decision` is provided (from AI #10), uses its delimiter, header
  * row index, and data range. Otherwise falls back to the original behavior
  * (row 0 = header, comma delimiter).
  */
-function parseCsvSchema(
-  buffer: Buffer,
+async function parseCsvSchema(
+  filePath: string,
   decision?: TableStructureDecision | null,
-): { columns: ParsedColumn[]; rowCount: number } {
-  // Strip UTF-8 BOM if present (common in Excel-exported CSVs)
-  const text = buffer.toString('utf-8').replace(/^﻿/, '');
-  const lines = text.split(/\r?\n/).filter(l => l.length > 0);
-
-  if (lines.length === 0) return { columns: [], rowCount: 0 };
-
+): Promise<{ columns: ParsedColumn[]; rowCount: number }> {
+  // Phase 2b (2026-06-08): streaming + reservoir sampling. Pre-fix this
+  // function loaded the full buffer + split into all lines + parsed every
+  // row's cells into a 2D array — peak memory ~3-4× file size on a 50MB
+  // CSV. Post-fix peak is bounded by reservoir size (k=100 rows × N cols).
+  //
+  // AI #10's headerRowIdx/dataStartRowIdx/dataEndRowIdx map to csv-parse's
+  // from_line/to_line:
+  //   - fromLine = headerRowIdx + 1 (1-indexed). csv-parse treats that
+  //     line as the header when columns: true (so caller is implicitly
+  //     setting "header is here, data starts on next line").
+  //   - toLine = dataEndRowIdx + 1 if set (caps where parsing stops).
+  // This narrows the legacy headerRowIdx/dataStartRowIdx pair to a single
+  // semantic (header IS at headerRowIdx; data ROW i+1) — the old
+  // dataStartRowIdx field is unused but kept on the type for back-compat.
   const delimiter = decision?.delimiter || ',';
   const headerRowIdx = decision?.headerRowIdx ?? 0;
-  const dataStartRowIdx = decision?.dataStartRowIdx ?? (headerRowIdx + 1);
   const dataEndRowIdx = decision?.dataEndRowIdx ?? null;
 
-  if (headerRowIdx >= lines.length) return { columns: [], rowCount: 0 };
+  const streamOpts: Parameters<typeof streamCsvRows>[1] = {
+    delimiter,
+    coerceTypes: true,
+    // csv-parse from_line is 1-indexed. headerRowIdx is 0-indexed.
+    fromLine: headerRowIdx + 1,
+    ...(dataEndRowIdx !== null ? { toLine: dataEndRowIdx + 1 } : {}),
+  };
 
-  const headers = splitByDelimiter(lines[headerRowIdx], delimiter);
+  // Drive the stream through reservoirSampleWithColumnDiscovery — same
+  // utility used by the JSON path (Phase 2a). The reservoir keeps a
+  // uniform random sample bounded by SCHEMA_SAMPLE_RESERVOIR_SIZE; the
+  // column-name set is built from the FIRST row's keys (csv-parse
+  // columns:true gives every row the same key set, so the column-discovery
+  // is effectively first-row-wins for CSV, unlike JSON's heterogeneous
+  // schemas).
+  let result: Awaited<ReturnType<typeof reservoirSampleWithColumnDiscovery>>;
+  try {
+    result = await reservoirSampleWithColumnDiscovery(
+      streamCsvRows(filePath, streamOpts),
+      SCHEMA_SAMPLE_RESERVOIR_SIZE,
+    );
+  } catch (err) {
+    // Stream-level error (csv-parse error, file I/O, etc.) — surface to
+    // the uploader's catch for a structured error response.
+    throw new Error(`CSV stream parsing failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
-  const dataLines = lines.slice(
-    dataStartRowIdx,
-    dataEndRowIdx === null ? lines.length : Math.min(lines.length, dataEndRowIdx + 1),
-  );
+  if (result.rowCount === 0) return { columns: [], rowCount: 0 };
 
-  // Parse ALL data rows (not just first N) so we can sample
-  // per-column non-empty values for representative AI #1 mapping.
-  const allParsedRows: string[][] = dataLines.map((l) => splitByDelimiter(l, delimiter));
-
-  // Dedup repeated header names so duplicates don't collide silently
+  // Dedup repeated header names so duplicates don't collide silently. The
+  // legacy logic ran on the raw header row; here we run it on the keys
+  // observed in the FIRST sampled row (csv-parse columns:true uses the
+  // first DATA row's header line as the key source, so subsequent rows
+  // all share the same key set).
   const seen = new Map<string, number>();
-  const finalNames = headers.map((rawName, idx) => {
-    const base = normalizeColumnName(rawName) || `column_${idx + 1}`;
+  const headerNameMap = new Map<string, string>(); // raw → normalized+deduped
+  for (const rawName of result.allColumnNames) {
+    const base = normalizeColumnName(rawName) || `column_${headerNameMap.size + 1}`;
     const count = seen.get(base) || 0;
     seen.set(base, count + 1);
-    return count === 0 ? base : `${base}_${count}`;
-  });
+    headerNameMap.set(rawName, count === 0 ? base : `${base}_${count}`);
+  }
 
-  const columns: ParsedColumn[] = finalNames.map((name, idx) => {
-    const allValues = allParsedRows.map((row) => coerceValue(row[idx] ?? ''));
-    const samples = sampleColumnValues(allValues);
+  const columns: ParsedColumn[] = result.allColumnNames.map((rawName) => {
+    const name = headerNameMap.get(rawName) || rawName;
+    // Extract values from the reservoir sample (already type-coerced by
+    // csv-parse via legacyCoerce). Missing keys → null.
+    const reservoirValues = result.sample.map((row) => {
+      const v = row[rawName];
+      return v === undefined ? null : v;
+    });
+    const samples = sampleColumnValues(reservoirValues);
     const type = inferType(samples);
     return { name, type, samples };
   });
 
-  return { columns, rowCount: dataLines.length };
-}
-
-/**
- * Parse a single CSV line handling quoted fields.
- */
-function parseCsvLine(line: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  result.push(current.trim());
-  return result;
+  return { columns, rowCount: result.rowCount };
 }
 
 /**
  * Parse a JSON file and extract schema + sample values.
+ *
+ * Phase 2 (2026-06-08): streaming + reservoir sampling.
+ *
+ * Pre-fix: JSON.parse(buffer.toString('utf-8')) built the full object
+ * graph in memory — for a 50MB JSON file with 1M nested rows the heap
+ * peak was 100-200MB just to pick 10 sample values per column.
+ *
+ * Post-fix: streamJsonRows yields rows one-at-a-time;
+ * reservoirSampleWithColumnDiscovery keeps a fixed-size sample +
+ * accumulates the union of all observed keys. Peak memory is bounded by
+ * SCHEMA_SAMPLE_RESERVOIR_SIZE rows (~50KB for 100 typical rows), not
+ * file size.
+ *
+ * Heterogeneous-schema correctness: the reservoir variant tracks
+ * `allColumnNames` separately from the sample so rare columns that
+ * appear only in late rows are still discovered, even if they're not
+ * in the reservoir sample. Matches the old behavior's column-discovery
+ * step (`rows.forEach(row => Object.keys(row).forEach(...))`).
+ *
+ * Shape contract preserved:
+ *   - Array root: yielded rows ARE the array entries
+ *   - Object root with one array value: stream-json's `pick(rowKey)`
+ *     filter yields the entries of that array
+ *   - Object root with no array: stream-json's parseJsonFileBuffered
+ *     fallback yields [parsed] (one row = the whole object)
+ *   - Scalar root: empty stream → 0 rows, 0 columns
  */
-function parseJsonSchema(buffer: Buffer): { columns: ParsedColumn[]; rowCount: number } {
-  const text = buffer.toString('utf-8');
-  const parsed = JSON.parse(text);
+const SCHEMA_SAMPLE_RESERVOIR_SIZE = 100;
 
-  let rows: Record<string, unknown>[];
-  if (Array.isArray(parsed)) {
-    rows = parsed;
-  } else if (typeof parsed === 'object' && parsed !== null) {
-    // Try to find an array in the first level
-    const arrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-    rows = arrayKey ? parsed[arrayKey] : [parsed];
-  } else {
-    return { columns: [], rowCount: 0 };
-  }
+async function parseJsonSchema(filePath: string): Promise<{ columns: ParsedColumn[]; rowCount: number }> {
+  const { sample, allColumnNames, rowCount } = await reservoirSampleWithColumnDiscovery(
+    streamJsonRows<Record<string, unknown>>(filePath),
+    SCHEMA_SAMPLE_RESERVOIR_SIZE,
+  );
 
-  if (rows.length === 0) return { columns: [], rowCount: 0 };
+  if (rowCount === 0) return { columns: [], rowCount: 0 };
 
-  // Collect all column names
-  const colNames = new Set<string>();
-  rows.forEach(row => Object.keys(row).forEach(k => colNames.add(k)));
-
-  const columns: ParsedColumn[] = Array.from(colNames).map(rawName => {
+  const columns: ParsedColumn[] = allColumnNames.map((rawName) => {
     const name = normalizeColumnName(rawName);
-    const allValues = rows.map((row) => row[rawName] ?? null);
-    const samples = sampleColumnValues(allValues);
+    // Extract values from the reservoir sample. Missing keys → null. The
+    // sample is uniform random over the stream, so per-column null rate
+    // approximates the file's true null rate.
+    const reservoirValues = sample.map((row) => row[rawName] ?? null);
+    const samples = sampleColumnValues(reservoirValues);
     const type = inferType(samples);
     return { name, type, samples };
   });
 
-  return { columns, rowCount: rows.length };
+  return { columns, rowCount };
 }
 
 /**
@@ -551,6 +562,23 @@ export async function uploadFile(
     return { success: false, error: `Unsupported file type: ${fileName}` };
   }
 
+  // Phase 0 (2026-06-07): refuse oversized files BEFORE the full bulk read.
+  // Pre-fix: fs.readFileSync allocates ~fileSize bytes synchronously; on a
+  // ~500MB file the V8 heap (default ~1.5GB) is pinned for the entire upload
+  // and a 1GB+ file simply OOM-kills the sidecar with no user-facing error.
+  // Post-fix: structured error returned to the platform; user sees a clear
+  // "file too large" message with the actual cap, not a silent timeout.
+  const fileSizeLimit = config?.maxFileSize ?? 50 * 1024 * 1024;
+  if (stats.size > fileSizeLimit) {
+    return {
+      success: false,
+      error:
+        `File "${fileName}" is ${(stats.size / 1024 / 1024).toFixed(1)}MB, ` +
+        `exceeds the agent's ${(fileSizeLimit / 1024 / 1024).toFixed(0)}MB limit. ` +
+        `Increase maxFileSize in ~/.universal-bi/config.json or split the file.`,
+    };
+  }
+
   // Read and parse the file locally
   const buffer = fs.readFileSync(resolved);
 
@@ -577,11 +605,20 @@ export async function uploadFile(
 
   try {
     if (fileType === 'csv') {
-      const result = parseCsvSchema(buffer, structureDecision);
+      // Phase 2b (2026-06-08): CSV now streams through csv-parse +
+      // reservoir-sample (mirrors Phase 2a's JSON path). The `buffer` arg
+      // is no longer used by parseCsvSchema (kept around just for the
+      // AI #10 structureDecision lookup above + the fileBytesHash);
+      // parser re-opens the file as a stream.
+      const result = await parseCsvSchema(resolved, structureDecision);
       columns = result.columns;
       rowCount = result.rowCount;
     } else if (fileType === 'json') {
-      const result = parseJsonSchema(buffer);
+      // Phase 2 (2026-06-08): JSON now uses streamJsonRows + reservoir
+      // sampling. The `buffer` arg is no longer used (kept around just for
+      // fileBytesHash above); the parser re-opens the file as a stream so
+      // peak memory is bounded by the reservoir size, not the file size.
+      const result = await parseJsonSchema(resolved);
       columns = result.columns;
       rowCount = result.rowCount;
     } else if (fileType === 'excel') {

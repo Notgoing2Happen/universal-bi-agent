@@ -93,3 +93,15 @@ export {
   type BridgePlanItem,
   type ImportTag,
 } from './bridge';
+
+// Shared parser primitives (canonical source of truth — Phase 1)
+export {
+  normalizeColumnName,
+  parseCsvLine,
+} from './parsers';
+
+// Version accessor (canonical source of truth — version fix, 2026-06-07)
+export {
+  getAgentVersion,
+  __resetAgentVersionCacheForTests,
+} from './version';

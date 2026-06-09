@@ -23,6 +23,56 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
+import {
+  normalizeColumnName,
+  parseCsvLine,
+  parseCsvFileBuffered,
+  parseJsonFileBuffered,
+} from './parsers';
+import { getAgentVersion } from './version';
+
+// Phase 0 (2026-06-07): file-size cap to prevent silent OOM crashes when
+// the sidecar tries to read a file larger than its heap budget. Reads
+// loadConfig().maxFileSize (default 50MB) — the same setting the uploader
+// uses. Falls back to 50MB if config isn't loaded yet (e.g. health check).
+function getMaxFileSize(): number {
+  const cfg = loadConfig();
+  return cfg?.maxFileSize ?? 50 * 1024 * 1024;
+}
+
+/**
+ * Phase 0 (2026-06-07): structured error for file-size violations.
+ * Platform catches this and surfaces a clear message to the user instead
+ * of timing out after the agent silently OOM-crashes.
+ */
+class FileTooLargeError extends Error {
+  readonly statusCode = 413;
+  readonly fileSize: number;
+  readonly limit: number;
+  constructor(filePath: string, fileSize: number, limit: number) {
+    super(
+      `File "${path.basename(filePath)}" is ${(fileSize / 1024 / 1024).toFixed(1)}MB, ` +
+      `exceeds the agent's ${(limit / 1024 / 1024).toFixed(0)}MB limit. ` +
+      `Increase maxFileSize in ~/.universal-bi/config.json or split the file.`,
+    );
+    this.name = 'FileTooLargeError';
+    this.fileSize = fileSize;
+    this.limit = limit;
+  }
+}
+
+/**
+ * Phase 0 (2026-06-07): wraps fs.statSync + size enforcement before any
+ * read. Returns nothing on success; throws FileTooLargeError on violation.
+ * Use at the entry of every code path that's about to fs.readFileSync.
+ */
+function enforceFileSizeCap(filePath: string): void {
+  const stats = fs.statSync(filePath);
+  const limit = getMaxFileSize();
+  if (stats.size > limit) {
+    throw new FileTooLargeError(filePath, stats.size, limit);
+  }
+}
 
 interface QueryRequest {
   connectionId: string;
@@ -59,88 +109,75 @@ const SAMPLE_ROWS = 10;
  *   "sampleTypeID" → "sample_type_id"
  *   "firstName" → "first_name"
  */
-function normalizeColumnName(name: string): string {
-  return name
-    // Insert underscore before uppercase letters that follow lowercase (camelCase → camel_case)
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    // Insert underscore before uppercase followed by lowercase after another uppercase (HTMLParser → html_parser)
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-    // Replace spaces and hyphens with underscores
-    .replace(/[\s-]+/g, '_')
-    // Lowercase everything
-    .toLowerCase()
-    // Collapse multiple underscores
-    .replace(/_+/g, '_')
-    // Remove leading/trailing underscores
-    .replace(/^_|_$/g, '');
-}
-
 /**
  * Parse a CSV file into rows with normalized column names.
+ *
+ * Phase 1 (2026-06-07, SCOPE.md): swapped from
+ *   readFileSync → split('\n') → manual parseCsvLine per line
+ * to a streaming csv-parse pipeline. Behavior gains:
+ *   - UTF-8 BOM stripped (was silently embedded in first header)
+ *   - Multi-line quoted fields parse correctly
+ *   - TSV files use the correct delimiter (was hardcoded ',' regardless)
+ *   - Type coercion preserved (empty/number/bool/string heuristic identical
+ *     to the legacy parser — see parsers/stream-csv.ts legacyCoerce()).
+ *
+ * Phase 1 keeps the materialized-array return shape for caller compatibility
+ * (applyFilters, slice, find all assume an Array). Phase 2 will switch the
+ * downstream pipeline to stream-and-sample.
  */
-function parseCsvFile(filePath: string): Record<string, unknown>[] {
-  const text = fs.readFileSync(filePath, 'utf-8');
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
-  if (lines.length < 2) return [];
+async function parseCsvFile(filePath: string): Promise<Record<string, unknown>[]> {
+  const ext = path.extname(filePath).toLowerCase();
+  const rawRows = await parseCsvFileBuffered(filePath, {
+    delimiter: ext === '.tsv' ? '\t' : undefined,
+  });
+  if (rawRows.length === 0) return [];
 
-  const rawHeaders = parseCsvLine(lines[0]);
-  const headers = rawHeaders.map(normalizeColumnName);
-  const rows: Record<string, unknown>[] = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const values = parseCsvLine(lines[i]);
-    const row: Record<string, unknown> = {};
-    for (let j = 0; j < headers.length; j++) {
-      const val = values[j] ?? '';
-      const num = Number(val);
-      if (val !== '' && !isNaN(num)) {
-        row[headers[j]] = num;
-      } else if (val.toLowerCase() === 'true') {
-        row[headers[j]] = true;
-      } else if (val.toLowerCase() === 'false') {
-        row[headers[j]] = false;
-      } else {
-        row[headers[j]] = val;
-      }
-    }
-    rows.push(row);
+  // csv-parse with `columns: true` emits rows keyed by raw header strings.
+  // The legacy parser normalized headers BEFORE building rows; preserve that
+  // by remapping each row's keys through normalizeColumnName. Build the name
+  // map once from the first row to avoid per-row recomputation.
+  const firstRow = rawRows[0];
+  const nameMap = new Map<string, string>();
+  for (const key of Object.keys(firstRow)) {
+    nameMap.set(key, normalizeColumnName(key));
   }
+  const needsNormalization = Array.from(nameMap.entries()).some(([k, v]) => k !== v);
+  if (!needsNormalization) return rawRows;
 
-  return rows;
-}
-
-function parseCsvLine(line: string): string[] {
-  const result: string[] = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-      else { inQuotes = !inQuotes; }
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = '';
-    } else {
-      current += char;
+  return rawRows.map((row) => {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      normalized[nameMap.get(key) || normalizeColumnName(key)] = value;
     }
-  }
-  result.push(current.trim());
-  return result;
+    return normalized;
+  });
 }
 
 /**
  * Parse a JSON file into rows.
+ *
+ * Phase 1 (2026-06-07, SCOPE.md): swapped from a single fs.readFileSync +
+ * JSON.parse to a streaming stream-json pipeline. Shape sniffer peeks the
+ * first 16KB to decide:
+ *   - root [...]               → stream array elements
+ *   - root { data: [...], ... } (or items/rows/results/records/value)
+ *                              → stream the array under that key
+ *   - root { ... no array }    → fall back to buffered JSON.parse + [parsed]
+ *                                (preserves legacy parity; the consumer
+ *                                needs the whole object regardless)
+ *   - root scalar              → []
+ *
+ * Memory profile for row-bearing JSON files: peak ≈ size of the final rows
+ * array (no more 2-3× multiplier from UTF-8 string + parsed graph +
+ * extracted array). For a 50MB { data: [...] } file with 1KB rows, peak
+ * drops from ~150MB to ~50MB.
+ *
+ * Return shape preserved: still Record<string,unknown>[]. The
+ * normalizeRowColumns() wrapper around this call in loadFileData()
+ * continues to apply column-name normalization on the result.
  */
-function parseJsonFile(filePath: string): Record<string, unknown>[] {
-  const text = fs.readFileSync(filePath, 'utf-8');
-  const parsed = JSON.parse(text);
-  if (Array.isArray(parsed)) return parsed;
-  if (typeof parsed === 'object' && parsed !== null) {
-    const arrayKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]));
-    return arrayKey ? parsed[arrayKey] : [parsed];
-  }
-  return [];
+async function parseJsonFile(filePath: string): Promise<Record<string, unknown>[]> {
+  return parseJsonFileBuffered(filePath);
 }
 
 /**
@@ -219,12 +256,17 @@ function normalizeRowColumns(rows: Record<string, unknown>[]): Record<string, un
 /**
  * Load and parse a file based on extension.
  * All column names are normalized to snake_case lowercase.
+ *
+ * Phase 0 (2026-06-07): size-checked before any read. Throws
+ * FileTooLargeError if the file exceeds the configured maxFileSize cap.
+ * The HTTP handler catches it and returns 413 with a clear message.
  */
-function loadFileData(filePath: string): Record<string, unknown>[] {
+async function loadFileData(filePath: string): Promise<Record<string, unknown>[]> {
+  enforceFileSizeCap(filePath);
   const ext = path.extname(filePath).toLowerCase();
   let rows: Record<string, unknown>[];
-  if (ext === '.csv' || ext === '.tsv') rows = parseCsvFile(filePath);
-  else if (ext === '.json') rows = normalizeRowColumns(parseJsonFile(filePath));
+  if (ext === '.csv' || ext === '.tsv') rows = await parseCsvFile(filePath);
+  else if (ext === '.json') rows = normalizeRowColumns(await parseJsonFile(filePath));
   else if (ext === '.xlsx' || ext === '.xls') rows = normalizeRowColumns(parseExcelFile(filePath));
   else throw new Error(`Unsupported file type: ${ext}`);
   return rows;
@@ -311,8 +353,13 @@ export function startQueryServer(port: number = 9322): Promise<void> {
 
       try {
         if (req.url === '/health' && req.method === 'GET') {
+          // Phase 1 follow-up (2026-06-07): version was hardcoded '0.1.0' here
+          // since the agent's first commit — drifted across 33 releases until
+          // someone hit /health and realized the platform was reading a stale
+          // value. Now reads from process.env.AGENT_VERSION (set by the sidecar
+          // before this server starts). Throws if unset — see version.ts.
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok', version: '0.1.0' }));
+          res.end(JSON.stringify({ status: 'ok', version: getAgentVersion() }));
           return;
         }
 
@@ -333,7 +380,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           }
 
           // Parse file
-          let rows = loadFileData(filePath);
+          let rows = await loadFileData(filePath);
           const totalRows = rows.length;
 
           // Apply filters
@@ -387,7 +434,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          const rows = loadFileData(filePath);
+          const rows = await loadFileData(filePath);
 
           // Find the sample row
           const sampleNameLower = params.sampleName.toLowerCase();
@@ -472,7 +519,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          const rows = loadFileData(filePath);
+          const rows = await loadFileData(filePath);
           const columns = inferColumns(rows);
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -484,6 +531,28 @@ export function startQueryServer(port: number = 9322): Promise<void> {
         res.end(JSON.stringify({ error: 'Not found' }));
       } catch (err) {
         console.error('[QueryServer] Error:', err);
+        // Phase 0 (2026-06-07): distinguish structured errors (FileTooLargeError,
+        // RequestTooLargeError) from generic crashes so the platform can
+        // surface a clear user message instead of timing out on a silent OOM.
+        if (err instanceof FileTooLargeError) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: err.message,
+            code: 'FILE_TOO_LARGE',
+            fileSize: err.fileSize,
+            limit: err.limit,
+          }));
+          return;
+        }
+        if (err instanceof RequestTooLargeError) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: err.message,
+            code: 'REQUEST_BODY_TOO_LARGE',
+            limit: err.limit,
+          }));
+          return;
+        }
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Internal error' }));
       }
@@ -511,10 +580,45 @@ export function stopQueryServer(): void {
   }
 }
 
+/**
+ * Phase 0 (2026-06-07): structured error for HTTP body exceeding the cap.
+ */
+class RequestTooLargeError extends Error {
+  readonly statusCode = 413;
+  readonly limit: number;
+  constructor(limit: number) {
+    super(
+      `Request body exceeds the agent's ${(limit / 1024 / 1024).toFixed(0)}MB limit. ` +
+      `Split the request or increase maxFileSize in ~/.universal-bi/config.json.`,
+    );
+    this.name = 'RequestTooLargeError';
+    this.limit = limit;
+  }
+}
+
+/**
+ * Read an HTTP request body into a string.
+ *
+ * Phase 0 (2026-06-07): bounded by the same maxFileSize cap as file reads.
+ * Pre-fix: unbounded — a 1GB POST body would silently exhaust the heap
+ * before any file is even opened. Post-fix: destroys the request and
+ * throws RequestTooLargeError when accumulated bytes pass the cap.
+ */
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
+    const limit = getMaxFileSize();
+    let bytesReceived = 0;
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    req.on('data', (chunk: Buffer | string) => {
+      const chunkSize = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      bytesReceived += chunkSize;
+      if (bytesReceived > limit) {
+        req.destroy();
+        reject(new RequestTooLargeError(limit));
+        return;
+      }
+      body += chunk;
+    });
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });

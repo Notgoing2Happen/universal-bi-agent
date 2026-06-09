@@ -14,15 +14,15 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-deep-link": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-notification": "^2.0.0",
-    "@tauri-apps/plugin-deep-link": "^2.0.0",
     "@tauri-apps/plugin-shell": "^2.0.0",
+    "@universal-bi/agent-core": "workspace:*",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
-    "ws": "^8.16.0",
-    "@universal-bi/agent-core": "workspace:*"
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

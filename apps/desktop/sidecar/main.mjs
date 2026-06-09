@@ -9,6 +9,15 @@
  * so the Vite dev server (browser) can communicate without Tauri.
  */
 
+import { AGENT_VERSION } from './version.mjs';
+
+// Phase 1 follow-up (2026-06-07): propagate AGENT_VERSION to the agent-core
+// imports BEFORE they execute. agent-core's query-server.ts (/health) and
+// ipc-server.ts (event.ready) read process.env.AGENT_VERSION via the
+// canonical getAgentVersion() helper. Must be set before the import below
+// touches anything that depends on it. See packages/agent-core/src/version.ts.
+process.env.AGENT_VERSION = AGENT_VERSION;
+
 import { WebSocketServer } from 'ws';
 import {
   startQueryServer,
@@ -331,7 +340,13 @@ startQueryServer(QUERY_SERVER_PORT).then(() => {
       },
       body: JSON.stringify({
         queryServerUrl: `http://localhost:${QUERY_SERVER_PORT}`,
-        agentVersion: '0.1.19',
+        // Phase 1 follow-up (2026-06-07): was hardcoded '0.1.19' from
+        // commit 8855a6f (2026-01-19) and never bumped across 14 releases —
+        // the user's reported "platform shows v0.1.19 forever" bug.
+        // Reads from the canonical sidecar/version.mjs which CI rewrites
+        // from the pushed git tag at build time. Class-shape fix: ONE
+        // version source, every reader imports from it.
+        agentVersion: AGENT_VERSION,
       }),
     }).catch(err => {
       console.error('[Sidecar] Failed to register query server with platform:', err.message);
@@ -345,26 +360,246 @@ registerHandler('query.status', async () => {
   return { running: true, port: QUERY_SERVER_PORT, url: `http://localhost:${QUERY_SERVER_PORT}` };
 });
 
-// ─── Query Relay Polling ─────────────────────────────────────────────
-// Poll the platform for pending queries that need local file data.
-// This bridges the NAT gap: Cube.js on the server can't reach our
-// local machine, but we can poll the server for query requests.
+// ─── Query Relay (SSE primary, polling fallback) ────────────────────
+// Two transports to receive queries from the platform:
+//
+// PRIMARY: Server-Sent Events (SSE) — long-lived stream from
+// /api/agent/queries/stream. Platform pushes a `query` event the
+// moment submitAgentQuery is called. Latency: ~10-50ms (network RTT)
+// vs the old 2s polling floor. Combined with the parallel processing
+// below, a 10-chart dashboard goes from ~20s to ~1-2s wall-clock.
+//
+// FALLBACK: Polling — keeps the old 2s loop for the case where the
+// SSE connection drops between heartbeats. Bumped to 30s to be
+// gentler on the server now that SSE handles the hot path. The
+// platform tracks both as heartbeats (recordAgentPoll fires on both
+// SSE-connect/heartbeat AND each poll), so the F6/F8 offline detector
+// works no matter which transport is live.
+//
+// 2026-06-09: this replaces the prior 2s polling loop. The processing
+// helper is extracted so SSE + polling share the same parallel-batched
+// execution path.
 
-let queryPollingActive = false;
+/**
+ * Process a single relay query: read local file, POST result back.
+ * Called from both SSE handler (one at a time, no queue) and the
+ * polling loop (in parallel via Promise.allSettled).
+ */
+async function processRelayQuery(query, config) {
+  try {
+    const isSequenceRegion = query.extra?.type === 'sequence-region';
+    const endpoint = isSequenceRegion ? 'sequence-region' : 'query';
+    const requestBody = isSequenceRegion
+      ? {
+          connectionId: query.connectionId,
+          sampleName: query.extra.sampleName,
+          start: query.extra.start,
+          end: query.extra.end,
+          sequenceColumn: query.extra.sequenceColumn,
+        }
+      : {
+          connectionId: query.connectionId,
+          filePath: query.filePath,
+          columns: query.columns,
+          filters: query.filters,
+          limit: query.limit,
+        };
 
+    console.error(`[Sidecar] Processing relay ${endpoint} query ${query.id}`);
+
+    const queryRes = await fetch(`http://localhost:${QUERY_SERVER_PORT}/${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    let resultBody;
+    if (queryRes.ok) {
+      const result = await queryRes.json();
+      resultBody = isSequenceRegion ? result : { data: result.data || [] };
+    } else {
+      resultBody = { error: `Local query failed: ${queryRes.status}` };
+    }
+
+    await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(resultBody),
+    });
+
+    console.error(`[Sidecar] Relay query ${query.id} completed`);
+  } catch (queryErr) {
+    console.error(`[Sidecar] Relay query ${query.id} failed:`, queryErr.message);
+    try {
+      await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ error: queryErr.message }),
+      });
+    } catch { /* ignore */ }
+  }
+}
+
+// Tracks query IDs we've started processing. SSE may deliver a query,
+// and a concurrent polling pass may also pick it up before the SSE
+// processor has POSTed the result — without dedup we'd process twice.
+// Cleared opportunistically (entries older than 60s are pruned).
+const inFlightQueryIds = new Map(); // id → startedAt
+function shouldProcessQuery(queryId) {
+  // Prune entries older than 60s on every check (cheap, keeps the Map small)
+  const now = Date.now();
+  for (const [id, ts] of inFlightQueryIds) {
+    if (now - ts > 60_000) inFlightQueryIds.delete(id);
+  }
+  if (inFlightQueryIds.has(queryId)) return false;
+  inFlightQueryIds.set(queryId, now);
+  return true;
+}
+
+let queryRelayActive = false;
+
+/**
+ * SSE stream — primary transport. Opens a long-lived fetch streaming
+ * connection to /api/agent/queries/stream and parses events.
+ *
+ * Reconnects automatically with exponential backoff on disconnect.
+ * Node 20+ has native streaming `fetch` — no `eventsource` dependency
+ * needed (important for SEA packaging).
+ */
+async function startQuerySseStream() {
+  const config = loadConfig();
+  if (!config?.platformUrl || !config?.apiKey) {
+    console.error('[Sidecar] SSE stream skipped — no platform URL or API key');
+    return;
+  }
+
+  let backoffMs = 1000;
+  const MAX_BACKOFF_MS = 30_000;
+
+  while (queryRelayActive) {
+    let aborted = false;
+    const abortCtrl = new AbortController();
+    try {
+      console.error('[Sidecar] Opening SSE stream → /api/agent/queries/stream');
+      const res = await fetch(`${config.platformUrl}/api/agent/queries/stream`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${config.apiKey}`,
+          'Accept': 'text/event-stream',
+        },
+        signal: abortCtrl.signal,
+        // Note: NO AbortSignal.timeout — this is a long-lived stream.
+      });
+
+      if (!res.ok || !res.body) {
+        // Server responded with non-200 — probably old platform without
+        // SSE endpoint. Fall back to polling-only mode until next retry.
+        console.error(
+          `[Sidecar] SSE stream rejected (status=${res.status}). ` +
+          `Server may not support SSE yet; polling fallback will continue.`,
+        );
+        await new Promise(r => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+        continue;
+      }
+
+      console.error('[Sidecar] SSE stream OPEN — backoff reset');
+      backoffMs = 1000; // reset on successful open
+
+      // Read the stream as text and accumulate into an event buffer.
+      // SSE wire format: `event: <type>\ndata: <json>\n\n` (records
+      // separated by blank line).
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      while (queryRelayActive) {
+        const { done, value } = await reader.read();
+        if (done) {
+          console.error('[Sidecar] SSE stream closed by server — will reconnect');
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete events (terminated by \n\n)
+        let sep;
+        while ((sep = buffer.indexOf('\n\n')) >= 0) {
+          const rawEvent = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          if (!rawEvent.trim()) continue;
+
+          // Parse `event:` + `data:` lines
+          let eventType = 'message';
+          let dataLines = [];
+          for (const line of rawEvent.split('\n')) {
+            if (line.startsWith('event:')) eventType = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+          }
+          const dataStr = dataLines.join('\n');
+
+          if (eventType === 'query' && dataStr) {
+            try {
+              const query = JSON.parse(dataStr);
+              if (shouldProcessQuery(query.id)) {
+                // Fire-and-forget; processRelayQuery handles its own errors
+                // and POSTs the result back. We don't await here so multiple
+                // queries arriving in rapid succession can run in parallel.
+                processRelayQuery(query, config);
+              } else {
+                console.error(`[Sidecar] SSE dropped duplicate query ${query.id} (already in-flight)`);
+              }
+            } catch (parseErr) {
+              console.error('[Sidecar] SSE event parse error:', parseErr.message);
+            }
+          } else if (eventType === 'connected') {
+            console.error('[Sidecar] SSE connected event:', dataStr.substring(0, 100));
+          }
+          // heartbeat events: no-op, just keep the connection alive
+        }
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.error('[Sidecar] SSE stream error:', err.message?.substring(0, 120));
+      }
+      aborted = err.name === 'AbortError';
+    } finally {
+      try { abortCtrl.abort(); } catch { /* ignore */ }
+    }
+
+    if (!queryRelayActive || aborted) break;
+
+    // Reconnect after backoff
+    await new Promise(r => setTimeout(r, backoffMs));
+    backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+  }
+  console.error('[Sidecar] SSE stream loop exited');
+}
+
+/**
+ * Polling loop — safety-net transport. Catches queries that landed
+ * during the gap between an SSE disconnect and reconnect. Bumped from
+ * 2s → 30s now that SSE handles the hot path.
+ */
 async function startQueryPolling() {
   const config = loadConfig();
-  if (!config.platformUrl || !config.apiKey) {
+  if (!config?.platformUrl || !config?.apiKey) {
     console.error('[Sidecar] Query polling skipped — no platform URL or API key');
     return;
   }
 
-  queryPollingActive = true;
-  console.error('[Sidecar] Query relay polling started');
+  console.error('[Sidecar] Query relay polling started (safety-net, 30s interval)');
 
-  while (queryPollingActive) {
+  while (queryRelayActive) {
     try {
-      // Poll for pending queries
       const res = await fetch(`${config.platformUrl}/api/agent/queries`, {
         headers: { 'Authorization': `Bearer ${config.apiKey}` },
         signal: AbortSignal.timeout(10000),
@@ -372,103 +607,27 @@ async function startQueryPolling() {
 
       if (res.ok) {
         const { queries } = await res.json();
-        const queryList = queries || [];
+        const queryList = (queries || []).filter(q => shouldProcessQuery(q.id));
 
         if (queryList.length > 0) {
-          console.error(`[Sidecar] Processing ${queryList.length} relay queries in parallel`);
+          console.error(`[Sidecar] Polling found ${queryList.length} queries SSE missed — processing in parallel`);
+          await Promise.allSettled(queryList.map(q => processRelayQuery(q, config)));
         }
-
-        // PARALLEL EXECUTION (2026-05-28): process all pending queries
-        // concurrently rather than awaiting each one in sequence. Each
-        // query is independent — local file read + result POST — so
-        // they share no state and trivially fan out. Promise.allSettled
-        // ensures one query's failure doesn't block siblings.
-        //
-        // Impact: 14 cubes that previously serialized at ~2s each
-        // (28s wall) now complete in ~2-3s wall. Critical for fan-out
-        // prompts like "how many records per source" (S1 A/B test).
-        await Promise.allSettled((queryList).map(async (query) => {
-          try {
-            // Determine endpoint based on query type
-            const isSequenceRegion = query.extra?.type === 'sequence-region';
-            const endpoint = isSequenceRegion ? 'sequence-region' : 'query';
-            const requestBody = isSequenceRegion
-              ? {
-                  connectionId: query.connectionId,
-                  sampleName: query.extra.sampleName,
-                  start: query.extra.start,
-                  end: query.extra.end,
-                  sequenceColumn: query.extra.sequenceColumn,
-                }
-              : {
-                  connectionId: query.connectionId,
-                  filePath: query.filePath,
-                  columns: query.columns,
-                  filters: query.filters,
-                  limit: query.limit,
-                };
-
-            console.error(`[Sidecar] Processing relay ${endpoint} query ${query.id}`);
-
-            const queryRes = await fetch(`http://localhost:${QUERY_SERVER_PORT}/${endpoint}`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${config.apiKey}`,
-              },
-              body: JSON.stringify(requestBody),
-            });
-
-            let resultBody;
-            if (queryRes.ok) {
-              const result = await queryRes.json();
-              // Sequence region returns the full result; data queries return { data: [] }
-              resultBody = isSequenceRegion ? result : { data: result.data || [] };
-            } else {
-              resultBody = { error: `Local query failed: ${queryRes.status}` };
-            }
-
-            // Post result back to the platform
-            await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${config.apiKey}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(resultBody),
-            });
-
-            console.error(`[Sidecar] Relay query ${query.id} completed`);
-          } catch (queryErr) {
-            console.error(`[Sidecar] Relay query ${query.id} failed:`, queryErr.message);
-            // Try to report error back so the relay can fail-fast
-            // rather than waiting for the 30s timeout.
-            try {
-              await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${config.apiKey}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ error: queryErr.message }),
-              });
-            } catch { /* ignore */ }
-          }
-        }));
       }
     } catch (pollErr) {
-      // Network error — server might be down, try again later
       if (!pollErr.message?.includes('abort')) {
         console.error('[Sidecar] Query poll error:', pollErr.message?.substring(0, 60));
       }
     }
 
-    // Poll every 2 seconds
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // 30s — safety-net interval. SSE delivers the hot path.
+    await new Promise(resolve => setTimeout(resolve, 30_000));
   }
 }
 
-// Start polling after query server is ready
+// Start both transports after query server is ready
+queryRelayActive = true;
+startQuerySseStream();
 startQueryPolling();
 
 // ─── Start IPC (stdio for Tauri, WebSocket for dev) ─────────────────
