@@ -93,6 +93,10 @@ interface QueryRequest {
     contractVersion: number;
     groupBy: string[];
     aggregations: Array<{ type: string; column: string; alias: string }>;
+    // When set, the platform is serving LIVE pushdown against a PROVEN file
+    // fingerprint. If our current file's sig differs, we REFUSE to pre-aggregate
+    // (the file changed since it was proven) — closing the stale-proven race.
+    expectedFileSig?: string;
   };
 }
 
@@ -104,7 +108,7 @@ interface QueryResponse {
   aggregationApplied?: boolean;
   agentVersion?: string;
   pushdownContractVersion?: number;
-  _diag?: Record<string, number | boolean>;
+  _diag?: Record<string, number | boolean | string>;
 }
 
 const SAMPLE_ROWS = 10;
@@ -500,6 +504,11 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
+          // File fingerprint (mtime:size) for the platform's pushdown proven-state
+          // machine. Cheap; loadFileData also stat-checks for the size cap.
+          let fileSig = '';
+          try { const fst = fs.statSync(filePath); fileSig = `${Math.round(fst.mtimeMs)}:${fst.size}`; } catch { /* leave empty */ }
+
           // Parse file
           let rows = await loadFileData(filePath);
           const totalRows = rows.length;
@@ -516,24 +525,36 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // (applyAggregations → null), return ALL filtered rows with
           // aggregationApplied:false so the platform aggregates the complete set.
           let aggregationApplied = false;
-          let diag: Record<string, number | boolean> | undefined;
+          let diag: Record<string, number | boolean | string> | undefined;
           const spec = query.aggregationSpec;
           if (spec && spec.contractVersion === 1 && Array.isArray(spec.aggregations) && spec.aggregations.length > 0) {
-            const agg = applyAggregations(rows, spec);
-            if (agg) {
-              rows = agg.rows;
-              aggregationApplied = true;
-              diag = {
-                totalSourceRows: totalRows,
-                filteredRows,
-                groupCount: agg.rows.length,
-                keyCapHit: false,
-                nullMeasureRows: agg.nullMeasureRows,
-              };
+            if (spec.expectedFileSig && spec.expectedFileSig !== fileSig) {
+              // The file changed since the platform PROVED this cube → REFUSE to
+              // pre-aggregate (closes the stale-proven race). Return no rows + a
+              // sig-mismatch marker; the platform re-fetches raw and re-proves.
+              rows = [];
+              diag = { totalSourceRows: totalRows, filteredRows, sigMismatch: true, fileSig };
             } else {
-              diag = { totalSourceRows: totalRows, filteredRows, groupCount: 0, keyCapHit: true, nullMeasureRows: 0 };
+              const agg = applyAggregations(rows, spec);
+              if (agg) {
+                rows = agg.rows;
+                aggregationApplied = true;
+                diag = {
+                  totalSourceRows: totalRows,
+                  filteredRows,
+                  groupCount: agg.rows.length,
+                  keyCapHit: false,
+                  nullMeasureRows: agg.nullMeasureRows,
+                  fileSig,
+                };
+              } else {
+                diag = { totalSourceRows: totalRows, filteredRows, groupCount: 0, keyCapHit: true, nullMeasureRows: 0, fileSig };
+              }
             }
           }
+          // Always expose fileSig in _diag (even on the raw path) so the platform
+          // proven-state machine can fingerprint the file it just read.
+          if (!diag) diag = { totalSourceRows: totalRows, filteredRows, fileSig };
 
           // Select columns — skip when aggregated (the output already holds only
           // groupBy + measure-alias columns; projecting would strip the measures).
