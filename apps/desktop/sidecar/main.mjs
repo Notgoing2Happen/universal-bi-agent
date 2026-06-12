@@ -347,6 +347,15 @@ startQueryServer(QUERY_SERVER_PORT).then(() => {
         // from the pushed git tag at build time. Class-shape fix: ONE
         // version source, every reader imports from it.
         agentVersion: AGENT_VERSION,
+        // Phase 1 agent aggregation pushdown capability advertisement.
+        // Informational for the platform today (the driver learns capability
+        // from the per-query response envelope); stored for future pre-flight
+        // gating. Bump pushdownContractVersion only on a wire-breaking change.
+        capabilities: {
+          supportsPushdown: true,
+          pushdownContractVersion: 1,
+          supportsChunkedResponse: true,
+        },
       }),
     }).catch(err => {
       console.error('[Sidecar] Failed to register query server with platform:', err.message);
@@ -403,6 +412,8 @@ async function processRelayQuery(query, config) {
           columns: query.columns,
           filters: query.filters,
           limit: query.limit,
+          offset: query.offset,                    // chunked raw-path paging window
+          aggregationSpec: query.aggregationSpec,   // Phase 1 agent aggregation pushdown spec
         };
 
     console.error(`[Sidecar] Processing relay ${endpoint} query ${query.id}`);
@@ -419,7 +430,10 @@ async function processRelayQuery(query, config) {
     let resultBody;
     if (queryRes.ok) {
       const result = await queryRes.json();
-      resultBody = isSequenceRegion ? result : { data: result.data || [] };
+      // Forward the FULL envelope (data + pushdown fields aggregationApplied /
+      // agentVersion / pushdownContractVersion / _diag) so the platform driver
+      // can read them. Stripping to { data } would silently disable pushdown.
+      resultBody = isSequenceRegion ? result : { ...result, data: result.data || [] };
     } else {
       resultBody = { error: `Local query failed: ${queryRes.status}` };
     }

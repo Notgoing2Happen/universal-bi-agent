@@ -85,12 +85,26 @@ interface QueryRequest {
   }>;
   limit?: number;
   offset?: number;
+  // Phase 1 agent aggregation pushdown: when present, group the FULL filtered
+  // set by raw columns and return FINAL group rows. The math mirrors the
+  // platform's applyAggregation (sum/count/min/max) byte-for-byte so the shadow
+  // comparison holds. See docs/agent-aggregation-pushdown-design.md.
+  aggregationSpec?: {
+    contractVersion: number;
+    groupBy: string[];
+    aggregations: Array<{ type: string; column: string; alias: string }>;
+  };
 }
 
 interface QueryResponse {
   data: Record<string, unknown>[];
   totalRows: number;
   columns: Array<{ name: string; type: string }>;
+  // Pushdown envelope (absent on legacy/raw responses → platform aggregates).
+  aggregationApplied?: boolean;
+  agentVersion?: string;
+  pushdownContractVersion?: number;
+  _diag?: Record<string, number | boolean>;
 }
 
 const SAMPLE_ROWS = 10;
@@ -296,6 +310,113 @@ function applyFilters(rows: Record<string, unknown>[], filters: QueryRequest['fi
 }
 
 /**
+ * Group-cardinality cap. If an aggregation produces more groups than this
+ * (pathological near-unique key), bail to raw rows so the platform aggregates
+ * the full set — never silently truncate groups. High enough to never trip on
+ * real BI group-bys.
+ */
+const MAX_GROUP_KEYS = 500000;
+
+/**
+ * Agent aggregation pushdown (Phase 1). Groups the FULL filtered set by raw
+ * columns and reduces with sum/count/min/max — the associative subset.
+ *
+ * CORRECTNESS CONTRACT: every formula + the group-key construction + the
+ * keyValues shape MUST be byte-identical to the platform's
+ * `applyAggregation`/`computeAggregate` in apps/cube/drivers/nango-driver.js,
+ * or the shadow comparison diverges and pushdown never cuts over. Phase 1 is
+ * the safe subset only (no avg/stddev/distinct/caseWhen/date-trunc — those are
+ * gated out platform-side and never reach here).
+ *
+ * Honesty counters live in the RESPONSE _diag only (not as row columns) so the
+ * group rows stay byte-identical to applyAggregation's output and never leak a
+ * `_rowCount` column into the Cube.js result.
+ *
+ * Returns null when the group cap is exceeded → caller returns raw rows with
+ * aggregationApplied:false.
+ */
+export function applyAggregations(
+  rows: Record<string, unknown>[],
+  spec: { groupBy: string[]; aggregations: Array<{ type: string; column: string; alias: string }> },
+): { rows: Record<string, unknown>[]; nullMeasureRows: number } | null {
+  const groupBy = spec.groupBy || [];
+  const aggs = spec.aggregations || [];
+
+  // Mirror the platform applyAggregation's empty-input early return (it returns
+  // the input array — i.e. [] — regardless of groupBy, BEFORE the no-groupBy
+  // total-row branch). Matching it keeps pushdown byte-identical to the raw path
+  // and prevents a false shadow divergence on an empty / zero-row file.
+  if (rows.length === 0) return { rows: [], nullMeasureRows: 0 };
+
+  const computeAggregate = (
+    groupRows: Record<string, unknown>[],
+    agg: { type: string; column: string },
+  ): number | null => {
+    const get = (r: Record<string, unknown>) => r[agg.column];
+    switch (agg.type) {
+      case 'count':
+        if (agg.column === '*' || agg.column === '1') return groupRows.length;
+        return groupRows.filter(r => get(r) != null).length;
+      case 'sum':
+        return groupRows.reduce((s, r) => s + (parseFloat(get(r) as any) || 0), 0);
+      case 'min': {
+        const vals = groupRows.map(r => parseFloat(get(r) as any)).filter(v => !isNaN(v));
+        return vals.length > 0 ? Math.min(...vals) : null;
+      }
+      case 'max': {
+        const vals = groupRows.map(r => parseFloat(get(r) as any)).filter(v => !isNaN(v));
+        return vals.length > 0 ? Math.max(...vals) : null;
+      }
+      default:
+        // Unreachable: the platform gate only sends sum/count/min/max. Mirror
+        // applyAggregation's default (rows.length) defensively.
+        return groupRows.length;
+    }
+  };
+
+  // null-measure counter for the high-null-rate disclosure the platform
+  // reconstructs: max over measures of filtered rows whose measure col is
+  // null/blank (i.e. excluded from sum/min/max).
+  let nullMeasureRows = 0;
+  for (const a of aggs) {
+    if (a.column === '*' || a.column === '1') continue;
+    let n = 0;
+    for (const r of rows) { const v = r[a.column]; if (v == null || v === '') n++; }
+    if (n > nullMeasureRows) nullMeasureRows = n;
+  }
+
+  // No GROUP BY → a single total row.
+  if (groupBy.length === 0) {
+    const out: Record<string, unknown> = {};
+    for (const a of aggs) out[a.alias] = computeAggregate(rows, a);
+    return { rows: [out], nullMeasureRows };
+  }
+
+  // GROUP BY — mirror applyAggregation's key + keyValues construction exactly.
+  const groups = new Map<string, { rows: Record<string, unknown>[]; keyValues: Record<string, unknown> }>();
+  for (const row of rows) {
+    const groupKey = groupBy.map(col => String(row[col] ?? 'Unknown')).join('|||');
+    let g = groups.get(groupKey);
+    if (!g) {
+      if (groups.size >= MAX_GROUP_KEYS) return null; // cap exceeded → raw fallback
+      const keyValues: Record<string, unknown> = {};
+      for (const col of groupBy) keyValues[col] = row[col] != null ? row[col] : 'Unknown';
+      g = { rows: [], keyValues };
+      groups.set(groupKey, g);
+    }
+    g.rows.push(row);
+  }
+
+  const out: Record<string, unknown>[] = [];
+  for (const g of groups.values()) {
+    const resultRow: Record<string, unknown> = { ...g.keyValues };
+    for (const a of aggs) resultRow[a.alias] = computeAggregate(g.rows, a);
+    out.push(resultRow);
+  }
+  return { rows: out, nullMeasureRows };
+}
+
+/**
  * Resolve file path from connectionId using agent state.
  */
 function resolveFilePath(connectionId: string): string | null {
@@ -385,9 +506,38 @@ export function startQueryServer(port: number = 9322): Promise<void> {
 
           // Apply filters
           rows = applyFilters(rows, query.filters);
+          const filteredRows = rows.length;
 
-          // Select columns
-          if (query.columns && query.columns.length > 0) {
+          // ── Agent aggregation pushdown (Phase 1) ──────────────────────────
+          // When the platform sends an aggregationSpec, group the FULL filtered
+          // set here and return FINAL group rows (byte-identical to the
+          // platform's applyAggregation). Skips column projection + pagination:
+          // groups are final and the platform applies LIMIT. On group-cap bail
+          // (applyAggregations → null), return ALL filtered rows with
+          // aggregationApplied:false so the platform aggregates the complete set.
+          let aggregationApplied = false;
+          let diag: Record<string, number | boolean> | undefined;
+          const spec = query.aggregationSpec;
+          if (spec && spec.contractVersion === 1 && Array.isArray(spec.aggregations) && spec.aggregations.length > 0) {
+            const agg = applyAggregations(rows, spec);
+            if (agg) {
+              rows = agg.rows;
+              aggregationApplied = true;
+              diag = {
+                totalSourceRows: totalRows,
+                filteredRows,
+                groupCount: agg.rows.length,
+                keyCapHit: false,
+                nullMeasureRows: agg.nullMeasureRows,
+              };
+            } else {
+              diag = { totalSourceRows: totalRows, filteredRows, groupCount: 0, keyCapHit: true, nullMeasureRows: 0 };
+            }
+          }
+
+          // Select columns — skip when aggregated (the output already holds only
+          // groupBy + measure-alias columns; projecting would strip the measures).
+          if (!aggregationApplied && query.columns && query.columns.length > 0) {
             rows = rows.map(row => {
               const filtered: Record<string, unknown> = {};
               for (const col of query.columns!) {
@@ -397,14 +547,26 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             });
           }
 
-          // Pagination
-          const offset = query.offset || 0;
-          const limit = query.limit || 10000;
-          rows = rows.slice(offset, offset + limit);
+          // Pagination — skip entirely when an aggregationSpec was requested
+          // (aggregated groups are final → the platform applies LIMIT; a cap-bail
+          // returns the full filtered set so the platform aggregates correctly).
+          if (!spec) {
+            const offset = query.offset || 0;
+            const limit = query.limit || 10000;
+            rows = rows.slice(offset, offset + limit);
+          }
 
           const columns = inferColumns(rows);
 
-          const response: QueryResponse = { data: rows, totalRows, columns };
+          const response: QueryResponse = {
+            data: rows,
+            totalRows,
+            columns,
+            aggregationApplied,
+            agentVersion: getAgentVersion(),
+            pushdownContractVersion: 1,
+            _diag: diag,
+          };
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(response));
           return;
