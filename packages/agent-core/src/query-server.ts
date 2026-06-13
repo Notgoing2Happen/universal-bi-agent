@@ -23,6 +23,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
+import { getOrLoadParsedRows } from './file-cache';
+import { runSpec, isDuckdbAvailable } from './duckdb-engine';
+import type { QuerySpec } from './query-spec';
 import {
   normalizeColumnName,
   parseCsvLine,
@@ -80,8 +83,9 @@ interface QueryRequest {
   columns?: string[];       // Which columns to return (default: all)
   filters?: Array<{
     column: string;
-    operator: 'equals' | 'notEquals' | 'contains' | 'gt' | 'lt' | 'gte' | 'lte';
-    value: string | number;
+    operator: 'equals' | 'notEquals' | 'contains' | 'notContains' | 'startsWith' | 'endsWith' | 'gt' | 'lt' | 'gte' | 'lte' | 'set' | 'notSet';
+    value?: string | number;
+    values?: Array<string | number>;  // multi-value (IN / any-of)
   }>;
   limit?: number;
   offset?: number;
@@ -98,6 +102,11 @@ interface QueryRequest {
     // (the file changed since it was proven) — closing the stale-proven race.
     expectedFileSig?: string;
   };
+  // Phase 2/3: neutral query-spec (contractVersion 2). When present AND DuckDB is
+  // available the agent compiles it to DuckDB SQL and runs it over the file —
+  // covering shapes the JS path can't (date_trunc trends, COUNT DISTINCT). Any
+  // DuckDB-unavailable/error falls back to raw rows so the platform aggregates.
+  querySpec?: QuerySpec;
 }
 
 interface QueryResponse {
@@ -299,14 +308,33 @@ function applyFilters(rows: Record<string, unknown>[], filters: QueryRequest['fi
   return rows.filter(row => {
     return filters.every(f => {
       const val = row[f.column];
+      // Normalize to a value list (multi-value IN / any-of); ordered ops use vals[0].
+      const vals = (f.values && f.values.length) ? f.values : (f.value !== undefined ? [f.value] : []);
+      const v0 = vals[0];
+      // Ordered ops: mirror the DuckDB compiler (duckdb-engine.filterExpr) + the
+      // platform's orderedCompare — an ISO-date value compares as a DATE, else
+      // numeric. Without this, Number('2024-01-01')=NaN makes every date-range
+      // filter false → wrong honesty counters (filteredRows/nullMeasureRows).
+      const ordered = (cmp: (a: number, b: number) => boolean): boolean => {
+        if (/^\d{4}-\d{2}-\d{2}/.test(String(v0))) {
+          const a = Date.parse(String(val)), b = Date.parse(String(v0));
+          return Number.isNaN(a) || Number.isNaN(b) ? false : cmp(a, b);
+        }
+        return cmp(Number(val), Number(v0));
+      };
       switch (f.operator) {
-        case 'equals': return val == f.value;
-        case 'notEquals': return val != f.value;
-        case 'contains': return String(val).toLowerCase().includes(String(f.value).toLowerCase());
-        case 'gt': return Number(val) > Number(f.value);
-        case 'lt': return Number(val) < Number(f.value);
-        case 'gte': return Number(val) >= Number(f.value);
-        case 'lte': return Number(val) <= Number(f.value);
+        case 'equals': return vals.some(v => String(val) === String(v));
+        case 'notEquals': return !vals.some(v => String(val) === String(v));
+        case 'contains': return vals.some(v => String(val).toLowerCase().includes(String(v).toLowerCase()));
+        case 'notContains': return val == null ? true : !vals.some(v => String(val).toLowerCase().includes(String(v).toLowerCase()));
+        case 'startsWith': return vals.some(v => String(val).toLowerCase().startsWith(String(v).toLowerCase()));
+        case 'endsWith': return vals.some(v => String(val).toLowerCase().endsWith(String(v).toLowerCase()));
+        case 'gt': return ordered((a, b) => a > b);
+        case 'lt': return ordered((a, b) => a < b);
+        case 'gte': return ordered((a, b) => a >= b);
+        case 'lte': return ordered((a, b) => a <= b);
+        case 'set': return val !== null && val !== undefined && val !== '';
+        case 'notSet': return val === null || val === undefined || val === '';
         default: return true;
       }
     });
@@ -339,6 +367,30 @@ const MAX_GROUP_KEYS = 500000;
  * Returns null when the group cap is exceeded → caller returns raw rows with
  * aggregationApplied:false.
  */
+/**
+ * Count rows whose measure column is null/blank, max over measures — the
+ * null-rate disclosure signal the platform reconstructs. Mirrors the inline loop
+ * in applyAggregations, exposed for the contractVersion-2 (DuckDB) path so its
+ * honesty `_diag` counters match the JS path and the platform's silent-drop
+ * disclosures are never lost.
+ */
+function countNullMeasureRows(
+  rows: Record<string, unknown>[],
+  aggs: Array<{ type: string; column: string; alias: string }>,
+): number {
+  let n = 0;
+  for (const a of (aggs || [])) {
+    if (a.column === '*' || a.column === '1') continue;
+    let c = 0;
+    for (const r of rows) {
+      const v = r[a.column];
+      if (v == null || v === '') c++;
+    }
+    if (c > n) n = c;
+  }
+  return n;
+}
+
 export function applyAggregations(
   rows: Record<string, unknown>[],
   spec: { groupBy: string[]; aggregations: Array<{ type: string; column: string; alias: string }> },
@@ -504,18 +556,96 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          // File fingerprint (mtime:size) for the platform's pushdown proven-state
-          // machine. Cheap; loadFileData also stat-checks for the size cap.
+          // File fingerprint for the platform's pushdown proven-state machine.
+          // mtime:size is the FALLBACK; the authoritative value is the parse
+          // cache's CONTENT hash (set below) so the fingerprint + the agent's
+          // expectedFileSig staleness guard are content-exact — mtime:size can
+          // collide on a same-size edit within one filesystem-timestamp tick,
+          // which would let a changed file serve a stale proven aggregate.
           let fileSig = '';
           try { const fst = fs.statSync(filePath); fileSig = `${Math.round(fst.mtimeMs)}:${fst.size}`; } catch { /* leave empty */ }
 
-          // Parse file
-          let rows = await loadFileData(filePath);
+          // Parse file (cached: one parse serves all pages / fan-out cubes /
+          // repeat questions; keyed by content hash so any file change busts it).
+          // READ-ONLY: `rows` may be a SHARED cached array — consumers below
+          // (applyFilters/applyAggregations/projection/slice) all return new
+          // arrays/objects and never mutate it in place. Keep it that way.
+          const loaded = await getOrLoadParsedRows(filePath, loadFileData);
+          let rows = loaded.rows;
+          const cacheHit = loaded.cacheHit;
           const totalRows = rows.length;
+          // Prefer the content hash when the cache produced one (it does unless
+          // AGENT_FILECACHE_DISABLED). `sha:` prefix marks the scheme.
+          if (loaded.sha256) fileSig = `sha:${loaded.sha256}`;
 
           // Apply filters
           rows = applyFilters(rows, query.filters);
           const filteredRows = rows.length;
+
+          // ── Agent DuckDB pushdown (contractVersion 2) ─────────────────────
+          // A neutral query-spec (filters + group-by + aggregations + date_trunc)
+          // the agent compiles to DuckDB SQL and runs over the file, returning
+          // FINAL group rows. Covers shapes the JS path can't (date_trunc trends,
+          // COUNT DISTINCT) and is byte-validated vs the JS reference under the
+          // platform shadow gate before any live cutover. Honesty counters still
+          // come from the (cached) JS parse so the platform's silent-drop
+          // disclosures are never lost. ANY DuckDB-unavailable / error → raw
+          // fallback (the platform aggregates the full set) — never silently wrong.
+          const v2 = query.querySpec;
+          // Require a well-formed spec (aggregations present) — a malformed v2
+          // request (e.g. corruption / version skew) falls through to the raw
+          // path rather than crashing countNullMeasureRows / the compiler.
+          if (v2 && v2.contractVersion === 2 && Array.isArray(v2.aggregations) && v2.aggregations.length > 0) {
+            const src = loaded.rows;
+            const send = (r: QueryResponse) => {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(r));
+            };
+            // Staleness guard — file changed since the platform proved this cube.
+            if (v2.expectedFileSig && v2.expectedFileSig !== fileSig) {
+              send({
+                data: [], totalRows: src.length, columns: [], aggregationApplied: false,
+                agentVersion: getAgentVersion(), pushdownContractVersion: 2,
+                _diag: { totalSourceRows: src.length, filteredRows: 0, sigMismatch: true, fileSig, cacheHit, engine: 'duckdb' },
+              });
+              return;
+            }
+            const jsFiltered = applyFilters(src, v2.filters as QueryRequest['filters']);
+            const counters: Record<string, number | boolean | string> = {
+              totalSourceRows: src.length,
+              filteredRows: jsFiltered.length,
+              nullMeasureRows: countNullMeasureRows(jsFiltered, v2.aggregations),
+              fileSig,
+              cacheHit,
+            };
+            let duckRows: Record<string, unknown>[] | null = null;
+            try {
+              duckRows = await runSpec(v2, filePath);
+            } catch (e) {
+              console.warn('[query] DuckDB v2 spec failed — raw fallback:', e instanceof Error ? e.message : String(e));
+            }
+            if (duckRows) {
+              send({
+                data: duckRows, totalRows: src.length, columns: inferColumns(duckRows),
+                aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: 2,
+                _diag: { ...counters, engine: 'duckdb', groupCount: duckRows.length },
+              });
+              return;
+            }
+            // Fallback: DuckDB unavailable/errored → return the RAW (unfiltered)
+            // rows so the PLATFORM applies its own authoritative filters + then
+            // aggregates the full set. Returning jsFiltered would be DOUBLE-filtered
+            // (the driver re-applies cubeQuery.filters on the raw branch) and could
+            // diverge from the platform's filter semantics — raw src keeps the
+            // platform's filter as the single source of truth. Counters below still
+            // reflect the agent's filtered count for the honesty signal.
+            send({
+              data: src, totalRows: src.length, columns: inferColumns(src),
+              aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: 2,
+              _diag: { ...counters, engine: 'js-fallback', duckdbAvailable: isDuckdbAvailable() },
+            });
+            return;
+          }
 
           // ── Agent aggregation pushdown (Phase 1) ──────────────────────────
           // When the platform sends an aggregationSpec, group the FULL filtered
@@ -555,6 +685,9 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // Always expose fileSig in _diag (even on the raw path) so the platform
           // proven-state machine can fingerprint the file it just read.
           if (!diag) diag = { totalSourceRows: totalRows, filteredRows, fileSig };
+          // Surface the parse-cache outcome for observability (confirms the cache
+          // hits on the paging / fan-out case).
+          diag.cacheHit = cacheHit;
 
           // Select columns — skip when aggregated (the output already holds only
           // groupBy + measure-alias columns; projecting would strip the measures).
@@ -617,7 +750,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          const rows = await loadFileData(filePath);
+          const { rows } = await getOrLoadParsedRows(filePath, loadFileData);
 
           // Find the sample row
           const sampleNameLower = params.sampleName.toLowerCase();
@@ -702,7 +835,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
-          const rows = await loadFileData(filePath);
+          const { rows } = await getOrLoadParsedRows(filePath, loadFileData);
           const columns = inferColumns(rows);
 
           res.writeHead(200, { 'Content-Type': 'application/json' });

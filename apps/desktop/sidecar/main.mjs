@@ -38,10 +38,14 @@ import {
   loadState,
   saveState,
   getStateSummary,
+  canonicalPathKey,
   syncDirectory,
   uploadFile,
   getCachedConcepts,
   cacheConcepts,
+  isDuckdbAvailable,
+  acquireInBackground,
+  nativeEngineAllowed,
 } from '@universal-bi/agent-core';
 
 // Wire up watcher events to IPC so they reach the Tauri UI
@@ -182,14 +186,15 @@ registerHandler('sync.importFile', async (params) => {
   // across tab switches and can be retried via "Sync Now"
   const fs = require('fs');
   const path = require('path');
-  const resolved = path.resolve(params.path);
+  const real = path.resolve(params.path);        // real path for file I/O
+  const key = canonicalPathKey(params.path);      // canonical key for state map
   const state = loadState();
-  if (!state.files[resolved]) {
-    state.files[resolved] = {
+  if (!state.files[key]) {
+    state.files[key] = {
       hash: '',
       connectionId: null,
       lastSyncedAt: '',  // empty = pending
-      size: fs.existsSync(resolved) ? fs.statSync(resolved).size : 0,
+      size: fs.existsSync(real) ? fs.statSync(real).size : 0,
     };
     saveState(state);
   }
@@ -223,7 +228,8 @@ registerHandler('sync.importFile', async (params) => {
 // File management handlers
 registerHandler('files.remove', async (params) => {
   const path = require('path');
-  const resolved = path.resolve(params.path);
+  const resolved = path.resolve(params.path);   // real path for server-notify
+  const key = canonicalPathKey(params.path);     // canonical key for state map
 
   // Notify server to deactivate the connection
   const config = loadConfig();
@@ -242,7 +248,7 @@ registerHandler('files.remove', async (params) => {
 
   // Remove from local state
   const state = loadState();
-  delete state.files[resolved];
+  delete state.files[key];
   saveState(state);
 
   sendEvent('event.log', {
@@ -261,7 +267,8 @@ registerHandler('files.remove', async (params) => {
 registerHandler('files.delete', async (params) => {
   const path = require('path');
   const fs = require('fs');
-  const resolved = path.resolve(params.path);
+  const resolved = path.resolve(params.path);   // real path for disk delete
+  const key = canonicalPathKey(params.path);     // canonical key for state map
   const baseName = path.basename(resolved);
 
   // 1. Notify server to deactivate the connection (best-effort)
@@ -282,7 +289,7 @@ registerHandler('files.delete', async (params) => {
   // 2. Remove from local tracking state (do this BEFORE unlink so the
   // watcher's delete event can't race a re-sync attempt)
   const state = loadState();
-  delete state.files[resolved];
+  delete state.files[key];
   saveState(state);
 
   // 3. Physically delete the file from disk
@@ -355,6 +362,15 @@ startQueryServer(QUERY_SERVER_PORT).then(() => {
           supportsPushdown: true,
           pushdownContractVersion: 1,
           supportsChunkedResponse: true,
+          // contractVersion-2 (neutral query-spec) support — honestly reflects
+          // whether a DuckDB binary is currently present (lazy-acquired). The
+          // platform should only send a v2 querySpec when supportsDuckdb is true.
+          supportsDuckdb: isDuckdbAvailable(),
+          // Whether the agent is permitted to lazily acquire DuckDB if absent
+          // (allowNativeEngine policy). Lets the platform know a cube may become
+          // DuckDB-capable shortly after first use even if it isn't yet.
+          canAcquireDuckdb: nativeEngineAllowed(loadConfig()),
+          querySpecContractVersion: 2,
         },
       }),
     }).catch(err => {
@@ -414,6 +430,7 @@ async function processRelayQuery(query, config) {
           limit: query.limit,
           offset: query.offset,                    // chunked raw-path paging window
           aggregationSpec: query.aggregationSpec,   // Phase 1 agent aggregation pushdown spec
+          querySpec: query.querySpec,               // Phase 2/3 contractVersion-2 DuckDB query-spec
         };
 
     console.error(`[Sidecar] Processing relay ${endpoint} query ${query.id}`);
@@ -707,3 +724,13 @@ if (isDev) {
 }
 
 console.error('[Sidecar] Universal BI Agent sidecar started');
+
+// Phase 0: if the operator opted into a native engine (allowNativeEngine /
+// AGENT_ALLOW_NATIVE_ENGINE), acquire the DuckDB CLI in the background so large
+// local-file aggregations can push down. No-op if a binary is already present
+// (bundled or on PATH) or the policy is off. Never blocks startup or queries.
+try {
+  acquireInBackground(loadConfig());
+} catch (err) {
+  console.error('[Sidecar] DuckDB background acquisition skipped:', err && err.message);
+}

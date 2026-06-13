@@ -38,6 +38,8 @@ export {
   removeFileState,
   getFileState,
   getStateSummary,
+  canonicalPathKey,
+  dedupeFiles,
   type FileState,
   type AgentState,
 } from './state';
@@ -105,3 +107,30 @@ export {
   getAgentVersion,
   __resetAgentVersionCacheForTests,
 } from './version';
+
+// DuckDB engine (Phase 3 — local SQL over large passthrough files)
+export {
+  findDuckdbBinary,
+  isDuckdbAvailable,
+  enginesDir,
+  compileSpecToSql,
+  runDuckdbJson,
+  runSpec,
+} from './duckdb-engine';
+// Engine acquisition (Phase 0 — bundle-discovery + policy-gated lazy download)
+export {
+  ensureDuckdbBinary,
+  acquireInBackground,
+  nativeEngineAllowed,
+  duckdbAssetForPlatform,
+} from './engine-acquire';
+export type {
+  QuerySpec,
+  SpecAggregation,
+  SpecFilter,
+  SpecDateTrunc,
+  SpecOrder,
+} from './query-spec';
+
+// Parsed-file cache (Phase 1)
+export { getOrLoadParsedRows, invalidateFileCache } from './file-cache';

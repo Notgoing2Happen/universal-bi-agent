@@ -37,6 +37,13 @@ export interface AgentConfig {
   retryBaseDelay: number;
   /** Heartbeat interval (ms) — how often agent pings the platform */
   heartbeatInterval: number;
+  /**
+   * Policy: may the agent acquire + run a NATIVE engine binary (DuckDB CLI) for
+   * fast large-file aggregation? Default OFF — the agent stays pure-JS unless the
+   * user/operator opts in (some environments forbid running fetched binaries).
+   * Also honored via the AGENT_ALLOW_NATIVE_ENGINE=true env override.
+   */
+  allowNativeEngine?: boolean;
 }
 
 const DEFAULT_CONFIG: Omit<AgentConfig, 'platformUrl' | 'apiKey'> = {

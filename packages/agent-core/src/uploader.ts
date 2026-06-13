@@ -17,7 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { AgentConfig } from './config';
-import { recordSync, getFileState, removeFileState, loadState, saveState } from './state';
+import { recordSync, getFileState, removeFileState, loadState, saveState, canonicalPathKey } from './state';
 import { normalizeColumnName, parseCsvLine, streamCsvRows, streamJsonRows, reservoirSampleWithColumnDiscovery } from './parsers';
 
 export interface UploadResult {
@@ -674,8 +674,9 @@ export async function uploadFile(
             // Connection was recreated or schema changed on server — update local state
             recordSync(resolved, schemaHash, syncData.connectionId || null, stats.size);
             const state = loadState();
-            if (state.files[resolved]) {
-              (state.files[resolved] as any).contentHash = contentHash;
+            const key = canonicalPathKey(resolved);
+            if (state.files[key]) {
+              (state.files[key] as any).contentHash = contentHash;
               saveState(state);
             }
             return { success: true, unchanged: false, connectionId: syncData.connectionId, isNew: syncData.isNew };
@@ -718,8 +719,9 @@ export async function uploadFile(
         recordSync(resolved, schemaHash, result.connectionId || null, stats.size);
         // Store content hash for row-change detection (extend state)
         const state = loadState();
-        if (state.files[resolved]) {
-          (state.files[resolved] as any).contentHash = contentHash;
+        const key = canonicalPathKey(resolved);
+        if (state.files[key]) {
+          (state.files[key] as any).contentHash = contentHash;
           saveState(state);
         }
 

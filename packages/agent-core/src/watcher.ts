@@ -13,6 +13,7 @@ import chokidar from 'chokidar';
 import { AgentConfig, WatchFolder, loadConfig } from './config';
 import { uploadFile, notifyFileDeletion } from './uploader';
 import { removeFileState } from './state';
+import { invalidateFileCache } from './file-cache';
 
 // Track pending uploads to debounce rapid changes
 const pendingUploads = new Map<string, NodeJS.Timeout>();
@@ -143,6 +144,7 @@ function watchFolder(folder: WatchFolder, config: AgentConfig): void {
   });
 
   watcher.on('change', (filePath: string) => {
+    invalidateFileCache(filePath); // drop the stale parse promptly (defense-in-depth)
     emitEvent('event.fileChanged', {
       path: filePath,
       name: path.basename(filePath),
@@ -153,6 +155,7 @@ function watchFolder(folder: WatchFolder, config: AgentConfig): void {
   });
 
   watcher.on('unlink', (filePath: string) => {
+    invalidateFileCache(filePath); // free the cached parse for a deleted file
     console.log(`[Deleted] ${path.basename(filePath)}`);
     emitEvent('event.fileChanged', {
       path: filePath,

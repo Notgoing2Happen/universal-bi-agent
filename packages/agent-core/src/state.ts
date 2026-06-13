@@ -27,12 +27,67 @@ export interface FileState {
 }
 
 export interface AgentState {
-  files: Record<string, FileState>; // key = absolute file path
+  files: Record<string, FileState>; // key = canonicalPathKey(absolute file path)
   lastHeartbeat?: string;
 }
 
 /**
+ * Canonical key for a file path used to index agent state.
+ *
+ * A single physical file reaches the agent through several code paths —
+ * drag-drop import (path.resolve of the OS drop path), the chokidar watcher
+ * (chokidar's emitted path), and directory scans (syncDirectory). On a
+ * case-insensitive filesystem (Windows) these can differ only by drive-letter
+ * case (`C:\` vs `c:\`) or separators, which would otherwise create TWO
+ * `state.files` entries — and TWO rows in the agent UI — for the same file
+ * (the duplicates that appear during a sync and "resolve" once everything
+ * converges on one representation).
+ *
+ * Keying every read/write by this canonical form collapses all representations
+ * to one entry STRUCTURALLY — no enumeration of which writer produced which
+ * casing. `path.resolve()` makes it absolute and normalizes separators / `..`;
+ * on win32 we case-fold because the filesystem is case-insensitive. POSIX paths
+ * are case-sensitive, so they're left untouched.
+ */
+export function canonicalPathKey(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/** Prefer the entry that is "more synced": one with a connectionId wins, then
+ * the more recently synced. Used when collapsing duplicate path representations. */
+function preferFileState(a: FileState, b: FileState): FileState {
+  const aHas = a.connectionId ? 1 : 0;
+  const bHas = b.connectionId ? 1 : 0;
+  if (aHas !== bHas) return aHas > bHas ? a : b;
+  const at = a.lastSyncedAt ? new Date(a.lastSyncedAt).getTime() : 0;
+  const bt = b.lastSyncedAt ? new Date(b.lastSyncedAt).getTime() : 0;
+  return bt >= at ? b : a;
+}
+
+/**
+ * Collapse any file entries that differ only by path representation (drive-letter
+ * case, separators) into a single canonical-keyed entry. Pure + idempotent:
+ * re-keying an already-canonical map is a no-op. Exposed for unit testing.
+ */
+export function dedupeFiles(
+  files: Record<string, FileState>
+): Record<string, FileState> {
+  const out: Record<string, FileState> = {};
+  for (const [rawKey, info] of Object.entries(files || {})) {
+    const key = canonicalPathKey(rawKey);
+    out[key] = out[key] ? preferFileState(out[key], info) : info;
+  }
+  return out;
+}
+
+/**
  * Load the agent state. Returns empty state if file doesn't exist.
+ *
+ * Normalizes on read: any legacy duplicate keys left by an older agent (before
+ * canonical keying) are collapsed here, so callers — and the UI's file list —
+ * see exactly one entry per physical file even before the next save rewrites
+ * the canonicalized map to disk.
  */
 export function loadState(): AgentState {
   if (!fs.existsSync(STATE_FILE)) {
@@ -41,7 +96,8 @@ export function loadState(): AgentState {
 
   try {
     const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-    return JSON.parse(raw) as AgentState;
+    const parsed = JSON.parse(raw) as AgentState;
+    return { ...parsed, files: dedupeFiles(parsed.files || {}) };
   } catch {
     return { files: {} };
   }
@@ -77,13 +133,13 @@ export function computeFileHash(filePath: string): Promise<string> {
  */
 export async function hasFileChanged(filePath: string): Promise<boolean> {
   const state = loadState();
-  const resolved = path.resolve(filePath);
-  const existing = state.files[resolved];
+  const real = path.resolve(filePath);          // real path for file I/O
+  const existing = state.files[canonicalPathKey(filePath)]; // canonical key for lookup
 
   if (!existing) return true; // Never synced
 
   try {
-    const currentHash = await computeFileHash(resolved);
+    const currentHash = await computeFileHash(real);
     return currentHash !== existing.hash;
   } catch {
     return true; // Can't read file — let uploader handle the error
@@ -100,9 +156,8 @@ export function recordSync(
   size: number
 ): void {
   const state = loadState();
-  const resolved = path.resolve(filePath);
 
-  state.files[resolved] = {
+  state.files[canonicalPathKey(filePath)] = {
     hash,
     connectionId,
     lastSyncedAt: new Date().toISOString(),
@@ -117,8 +172,7 @@ export function recordSync(
  */
 export function removeFileState(filePath: string): void {
   const state = loadState();
-  const resolved = path.resolve(filePath);
-  delete state.files[resolved];
+  delete state.files[canonicalPathKey(filePath)];
   saveState(state);
 }
 
@@ -127,7 +181,7 @@ export function removeFileState(filePath: string): void {
  */
 export function getFileState(filePath: string): FileState | null {
   const state = loadState();
-  return state.files[path.resolve(filePath)] || null;
+  return state.files[canonicalPathKey(filePath)] || null;
 }
 
 /**
