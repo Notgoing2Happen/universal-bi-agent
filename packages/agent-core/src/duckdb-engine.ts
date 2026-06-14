@@ -26,7 +26,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { execFile } from 'child_process';
+import { spawn } from 'child_process';
 import { getConfigDir } from './config';
 import type { QuerySpec, SpecAggregation, SpecFilter, SpecDateTrunc } from './query-spec';
 
@@ -243,42 +243,62 @@ export function compileSpecToSql(spec: QuerySpec, filePath: string): string {
  */
 export const PUSHDOWN_DUCKDB_TIMEOUT_MS = 10_000;
 
-/** Run a raw SQL statement via the DuckDB CLI and parse its JSON output. */
+/**
+ * Run a raw SQL statement via the DuckDB CLI and parse its JSON output.
+ *
+ * Uses `spawn` (NOT execFile) with stdin explicitly IGNORED + an INDEPENDENT timer —
+ * the two changes that matter for the Windows Tauri-SEA-sidecar (GUI subsystem, no console)
+ * spawn hang:
+ *  - `stdio: ['ignore','pipe','pipe']` — the default piped-but-never-closed stdin from a
+ *    no-console parent can block the child / spawn-init indefinitely on Windows
+ *    (nodejs#52364). Ignoring stdin removes that handle entirely.
+ *  - An INDEPENDENT `setTimeout` (not execFile's `timeout` option) — execFile's timeout
+ *    only arms AFTER the child spawns, so it can't bound a hang IN spawn-init (the exact
+ *    v0.1.41/0.1.42 failure mode: the 10s timeout never fired). This timer fires regardless;
+ *    on fire we SIGKILL any child + reject, so the caller falls back to RAW rows in budget.
+ */
 export function runDuckdbJson(binary: string, sql: string, timeoutMs = 30000): Promise<Rows> {
   return new Promise((resolve, reject) => {
     const t0 = Date.now();
-    execFile(
-      binary,
-      ['-json', '-c', sql],
-      { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true },
-      (err, stdout, stderr) => {
-        if (err) {
-          const ms = Date.now() - t0;
-          // execFile's `timeout` kills the child (killed=true / SIGTERM). Surface a
-          // timeout DISTINCTLY from a SQL error so a child_process spawn hang is
-          // diagnosable in the agent logs — the v0.1.41 SEA hang reads
-          // "TIMED OUT after 10000ms" here instead of an opaque failure.
-          const timedOut = err.killed === true || err.signal === 'SIGTERM';
-          reject(new Error(
-            timedOut
-              ? `duckdb exec TIMED OUT after ${ms}ms (limit ${timeoutMs}ms) — likely a child_process spawn hang`
-              : `duckdb exec failed after ${ms}ms: ${(stderr || '').trim() || err.message}`,
-          ));
-          return;
-        }
-        const out = (stdout || '').trim();
-        if (!out) {
-          resolve([]);
-          return;
-        }
-        try {
-          const parsed = JSON.parse(out);
-          resolve(Array.isArray(parsed) ? parsed : [parsed]);
-        } catch (e) {
-          reject(new Error(`duckdb JSON parse failed: ${e instanceof Error ? e.message : String(e)}`));
-        }
-      },
-    );
+    let settled = false;
+    let child: ReturnType<typeof spawn> | undefined;
+    let stdout = '';
+    let stderr = '';
+    let overflow = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { if (child && child.pid) child.kill('SIGKILL'); } catch { /* best effort */ }
+      reject(new Error(`duckdb TIMED OUT after ${Date.now() - t0}ms (limit ${timeoutMs}ms) — spawn/exec did not complete (independent timer; likely a SEA child_process spawn-init hang)`));
+    }, timeoutMs);
+
+    const finish = (fn: () => void) => { if (settled) return; settled = true; clearTimeout(timer); fn(); };
+
+    try {
+      child = spawn(binary, ['-json', '-c', sql], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    } catch (e) {
+      finish(() => reject(new Error(`duckdb spawn threw after ${Date.now() - t0}ms: ${e instanceof Error ? e.message : String(e)}`)));
+      return;
+    }
+    child.on('error', (err) => finish(() => reject(new Error(`duckdb spawn error after ${Date.now() - t0}ms: ${err.message}`))));
+    child.stdout?.on('data', (d) => {
+      stdout += d;
+      if (stdout.length > 256 * 1024 * 1024 && !overflow) { overflow = true; try { child!.kill('SIGKILL'); } catch { /* best effort */ } }
+    });
+    child.stderr?.on('data', (d) => { stderr += d; });
+    child.on('close', (code) => finish(() => {
+      if (overflow) { reject(new Error(`duckdb output exceeded 256MB after ${Date.now() - t0}ms`)); return; }
+      if (code !== 0) { reject(new Error(`duckdb exited ${code} after ${Date.now() - t0}ms: ${(stderr || '').trim().slice(0, 200) || 'no stderr'}`)); return; }
+      const out = stdout.trim();
+      if (!out) { resolve([]); return; }
+      try {
+        const parsed = JSON.parse(out);
+        resolve(Array.isArray(parsed) ? parsed : [parsed]);
+      } catch (e) {
+        reject(new Error(`duckdb JSON parse failed after ${Date.now() - t0}ms: ${e instanceof Error ? e.message : String(e)}`));
+      }
+    }));
   });
 }
 

@@ -22,13 +22,14 @@ on:
         default: 'v0.1.0'
 
 env:
-  # PINNED PATCH (not just '20'): sidecar/build-binary.mjs embeds the runner's
-  # process.execPath AS the SEA's Node runtime, so an unpinned major lets the runner's
-  # Node-20 patch DRIFT between builds. v0.1.41 shipped a patch whose child_process
-  # spawn hung in the SEA/Windows context — the DuckDB v2 pushdown hung 25s (raw
-  # fallback still served correctly). Pin so the embedded runtime is deterministic +
-  # verified. Bump deliberately only after testing the SEA on the new patch.
-  NODE_VERSION: '20.18.1'
+  # PINNED PATCH (not just a major): sidecar/build-binary.mjs embeds the runner's
+  # process.execPath AS the SEA's Node runtime, so an unpinned major lets the patch DRIFT.
+  # On 22.x LTS per research: 20.12.2–21.x carry child_process regressions
+  # (CVE-2024-27980 EINVAL) and 24.x has a silent-termination issue (nodejs#62125); 22 LTS
+  # is the safe middle. The DuckDB spawn fix itself is in duckdb-engine.ts (spawn +
+  # stdio:['ignore',…] + independent timer) — this pin is belt-and-suspenders. Bump
+  # deliberately only after testing the SEA on the new patch.
+  NODE_VERSION: '22.11.0'
   PNPM_VERSION: '10'
 
 jobs:
