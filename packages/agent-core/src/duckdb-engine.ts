@@ -315,7 +315,7 @@ export function runDuckdbJson(binary: string, sql: string, timeoutMs = 30000): P
  * Output parity: the engine renders rows via DuckDB's own `to_json` → byte-identical to the CLI
  * `-json` path, so the platform shadow gate compares like-for-like.
  */
-export function runViaRustEngine(sql: string, timeoutMs: number): Promise<Rows | null> {
+export function runViaRustEngine(sql: string, filePath: string, timeoutMs: number): Promise<Rows | null> {
   const port = process.env.AGENT_DUCKDB_RPC_PORT;
   if (!port) return Promise.resolve(null);
   return new Promise((resolve) => {
@@ -326,7 +326,9 @@ export function runViaRustEngine(sql: string, timeoutMs: number): Promise<Rows |
         resolve(v);
       }
     };
-    const payload = JSON.stringify({ sql });
+    // filePath lets the engine serve from a warm content-hash-keyed table (Phase 2 StoreRegistry);
+    // it rewrites the read_csv call → the warm table. Empty/unknown → engine runs the SQL inline.
+    const payload = JSON.stringify({ sql, filePath });
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -378,7 +380,7 @@ export async function runSpec(
 ): Promise<Rows | null> {
   const sql = compileSpecToSql(spec, filePath);
   const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
-  const viaRust = await runViaRustEngine(sql, timeoutMs);
+  const viaRust = await runViaRustEngine(sql, filePath, timeoutMs);
   if (viaRust !== null) return viaRust;
   const binary = opts.binary || findDuckdbBinary();
   if (!binary) return null;
@@ -422,7 +424,7 @@ export async function runPassthroughSql(
   const sql = translatedSql.split(PASSTHROUGH_VIEW).join(from);
   const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
   // Phase 1: prefer the in-process Rust engine (no CLI spawn); fall back to the CLI on any miss.
-  const viaRust = await runViaRustEngine(sql, timeoutMs);
+  const viaRust = await runViaRustEngine(sql, filePath, timeoutMs);
   if (viaRust !== null) return viaRust;
   const binary = opts.binary || findDuckdbBinary();
   if (!binary) return null;
