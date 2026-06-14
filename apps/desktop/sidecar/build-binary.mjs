@@ -70,6 +70,10 @@ const nodeBin = process.execPath;
 const outputName = `universal-bi-sidecar-${targetTriple}${ext}`;
 const outputPath = resolve(binDir, outputName);
 
+// The SEA's runtime IS this Node binary — log the exact version so the embedded
+// runtime is auditable from the build log. A drifting patch here caused the v0.1.41
+// child_process spawn hang; NODE_VERSION is pinned in release-desktop.yml to prevent it.
+console.log(`  Embedding Node runtime: ${process.version} (${nodeBin})`);
 copyFileSync(nodeBin, outputPath);
 
 // On macOS, remove codesign before injecting

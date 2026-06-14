@@ -232,16 +232,38 @@ export function compileSpecToSql(spec: QuerySpec, filePath: string): string {
 
 // ── Execution ────────────────────────────────────────────────────────────────
 
+/**
+ * Bound pushdown DuckDB calls well under the platform's 25s per-cube deadline so a
+ * hung spawn fails fast → the caller falls back to RAW rows WITHIN budget (the user
+ * gets the answer, never a 25s timeout). DuckDB over a local file is normally <1-3s
+ * even for tens-of-MB CSVs, so 10s is a safety net, not a tight bound. Defense-in-depth
+ * for the v0.1.41 regression where the SEA-embedded Node hung on the DuckDB
+ * child_process spawn (the raw fallback served correctly the whole time, but at the
+ * 30s default the cube's 25s deadline fired first → a user-visible 25s timeout).
+ */
+export const PUSHDOWN_DUCKDB_TIMEOUT_MS = 10_000;
+
 /** Run a raw SQL statement via the DuckDB CLI and parse its JSON output. */
 export function runDuckdbJson(binary: string, sql: string, timeoutMs = 30000): Promise<Rows> {
   return new Promise((resolve, reject) => {
+    const t0 = Date.now();
     execFile(
       binary,
       ['-json', '-c', sql],
       { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true },
       (err, stdout, stderr) => {
         if (err) {
-          reject(new Error(`duckdb exec failed: ${(stderr || '').trim() || err.message}`));
+          const ms = Date.now() - t0;
+          // execFile's `timeout` kills the child (killed=true / SIGTERM). Surface a
+          // timeout DISTINCTLY from a SQL error so a child_process spawn hang is
+          // diagnosable in the agent logs — the v0.1.41 SEA hang reads
+          // "TIMED OUT after 10000ms" here instead of an opaque failure.
+          const timedOut = err.killed === true || err.signal === 'SIGTERM';
+          reject(new Error(
+            timedOut
+              ? `duckdb exec TIMED OUT after ${ms}ms (limit ${timeoutMs}ms) — likely a child_process spawn hang`
+              : `duckdb exec failed after ${ms}ms: ${(stderr || '').trim() || err.message}`,
+          ));
           return;
         }
         const out = (stdout || '').trim();
@@ -272,7 +294,7 @@ export async function runSpec(
   const binary = opts.binary || findDuckdbBinary();
   if (!binary) return null;
   const sql = compileSpecToSql(spec, filePath);
-  return runDuckdbJson(binary, sql, opts.timeoutMs);
+  return runDuckdbJson(binary, sql, opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS);
 }
 
 /**
@@ -312,5 +334,5 @@ export async function runPassthroughSql(
   // (Wrapping in parens — `FROM (read_csv_auto(...)) "t"` — is a DuckDB syntax error;
   // verified against the real binary before release.)
   const sql = translatedSql.split(PASSTHROUGH_VIEW).join(from);
-  return runDuckdbJson(binary, sql, opts.timeoutMs);
+  return runDuckdbJson(binary, sql, opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS);
 }
