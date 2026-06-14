@@ -37,6 +37,12 @@ const N_WORKERS: usize = 4;
 /// Materialized-table byte budget. Beyond this, LRU tables are dropped. Generous so eviction is
 /// rare for typical cube counts; DuckDB's `memory_limit` independently spills working memory.
 const TABLE_BYTE_BUDGET: u64 = 1_500_000_000; // ~1.5 GB
+/// Phase 3: files larger than this are NOT materialized into RAM — the query direct-scans them
+/// from disk (DuckDB streams), so a GB file can't OOM the warm store. Override via env.
+const DEFAULT_INMEM_MAX_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
+/// Phase 3: refuse to ship a result whose JSON exceeds this over the loopback (decline → CLI/raw)
+/// rather than streaming GBs. Aggregation group sets are tiny; this bounds pathological passthrough.
+const DEFAULT_RESPONSE_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MB
 
 // ── StoreRegistry ──────────────────────────────────────────────────────────────
 struct StoreMeta {
@@ -67,6 +73,10 @@ struct Shared {
     /// The materialize connection IS the single-flight lock: only one thread CREATE/DROPs at a
     /// time, and it shares the in-mem DB with all worker connections.
     mat: Mutex<Connection>,
+    /// Above this file size, direct-scan from disk instead of materializing into RAM (Phase 3 §2c).
+    inmem_max_bytes: u64,
+    /// Refuse to ship a result whose JSON exceeds this over the loopback (Phase 3 IPC contract).
+    response_max_bytes: usize,
 }
 
 /// Start the loopback DuckDB engine. Returns the bound 127.0.0.1 port.
@@ -89,9 +99,20 @@ pub fn start() -> Result<u16, String> {
     ))
     .ok();
 
+    let inmem_max_bytes = std::env::var("AGENT_DUCKDB_INMEM_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_INMEM_MAX_BYTES);
+    let response_max_bytes = std::env::var("AGENT_DUCKDB_RESPONSE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_RESPONSE_MAX_BYTES);
+
     let shared = Arc::new(Shared {
         registry: Mutex::new(Registry::new()),
         mat: Mutex::new(base.try_clone().map_err(|e| format!("try_clone mat: {e}"))?),
+        inmem_max_bytes,
+        response_max_bytes,
     });
 
     for i in 0..N_WORKERS {
@@ -162,6 +183,17 @@ fn handle(mut req: Request, conn: &Connection, shared: &Shared) {
     };
 
     match run_sql_as_json_array(conn, &effective_sql) {
+        // Phase 3 IPC contract: refuse to ship an oversized result over the loopback; decline with
+        // 200 + {error} → Node falls back to the CLI (which has its own cap) → raw. Never stream GBs.
+        Ok(rows_json) if rows_json.len() > shared.response_max_bytes => respond_json(
+            req,
+            200,
+            format!(
+                r#"{{"error":"result too large: {} bytes > cap {}"}}"#,
+                rows_json.len(),
+                shared.response_max_bytes
+            ),
+        ),
         Ok(rows_json) => respond_json(req, 200, format!(r#"{{"rows":{rows_json}}}"#)),
         // 200 + {error} (not 5xx) so the Node side parses it and falls back to the CLI cleanly.
         Err(e) => respond_json(req, 200, format!(r#"{{"error":"{}"}}"#, esc(&e))),
@@ -182,6 +214,14 @@ fn run_sql_as_json_array(conn: &Connection, sql: &str) -> Result<String, String>
 /// problem (missing file, unsupported ext, materialize error) → caller runs the SQL inline instead.
 fn resolve_warm_table(file_path: &str, shared: &Shared) -> Option<String> {
     let (size, mtime) = stat(file_path).ok()?;
+
+    // Phase 3 §2c: large files are NOT materialized into RAM. Returning None makes handle() run
+    // the inline read_csv, which DuckDB STREAMS from disk (respecting memory_limit → spills) — a
+    // GB file aggregates without OOM. (Trade-off: no warm reuse for large files yet; an on-disk
+    // .db cache for warm large-file reuse is deferred hardening.)
+    if size > shared.inmem_max_bytes {
+        return None;
+    }
 
     // 1. Stat fast-path: size+mtime unchanged since we last hashed → reuse the cached hash, no read.
     let cached_hash = {
