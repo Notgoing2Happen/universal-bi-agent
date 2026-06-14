@@ -274,3 +274,43 @@ export async function runSpec(
   const sql = compileSpecToSql(spec, filePath);
   return runDuckdbJson(binary, sql, opts.timeoutMs);
 }
+
+/**
+ * MUST match `AGENT_VIEW` in the platform's apps/cube/drivers/pg-to-duckdb.js — the
+ * translated SQL references the source under this name. A reserved-word-safe internal
+ * name so a cube logically named `order`/`table` can't collide with the relation.
+ */
+export const PASSTHROUGH_VIEW = '__agent_src__';
+
+/**
+ * Phase 1 SQL-passthrough: run the platform-translated DuckDB SQL over the local file —
+ * DuckDB as a local drop-in for the platform's pg-temp executor. The translated SQL
+ * references the source under `__agent_src__` (the platform's pg-to-duckdb.js rewrote the
+ * cube's table token to it). We INLINE-substitute that placeholder with the file-read
+ * clause, producing a SINGLE SELECT statement — this deliberately avoids a multi-statement
+ * (`CREATE VIEW …; SELECT …`) batch, whose DuckDB-CLI `-json` output can emit more than one
+ * JSON blob and break the parser. Phase 1 SQL has no date functions, so no `SET TimeZone`
+ * is needed yet (Phase 2 adds date_trunc + the UTC pin, at which point a verified
+ * statement-batching or init-file approach replaces the inline substitution).
+ *
+ * Returns null when no DuckDB binary (caller falls back to JS/raw); THROWS on a DuckDB
+ * error or unsupported file (buildFromClause throws for xlsx) so the caller catches it and
+ * falls back. The result is byte-validated against the pg-temp baseline by the platform
+ * shadow before it can ever serve — a bad translation diverges and is declined, never wrong.
+ */
+export async function runPassthroughSql(
+  translatedSql: string,
+  filePath: string,
+  opts: { binary?: string; timeoutMs?: number } = {},
+): Promise<Rows | null> {
+  const binary = opts.binary || findDuckdbBinary();
+  if (!binary) return null;
+  const from = buildFromClause(filePath); // throws for xlsx → caller falls back
+  // Replace EVERY occurrence of the source placeholder with the file-read clause —
+  // BARE (no wrapping parens): a table function takes its alias directly, so
+  // `FROM __agent_src__ "t"` → `FROM read_csv_auto('…', all_varchar=true) "t"`.
+  // (Wrapping in parens — `FROM (read_csv_auto(...)) "t"` — is a DuckDB syntax error;
+  // verified against the real binary before release.)
+  const sql = translatedSql.split(PASSTHROUGH_VIEW).join(from);
+  return runDuckdbJson(binary, sql, opts.timeoutMs);
+}

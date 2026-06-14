@@ -24,7 +24,7 @@ import * as path from 'path';
 import { loadState } from './state';
 import { loadConfig } from './config';
 import { getOrLoadParsedRows } from './file-cache';
-import { runSpec, isDuckdbAvailable } from './duckdb-engine';
+import { runSpec, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
 import type { QuerySpec } from './query-spec';
 import {
   normalizeColumnName,
@@ -107,6 +107,16 @@ interface QueryRequest {
   // covering shapes the JS path can't (date_trunc trends, COUNT DISTINCT). Any
   // DuckDB-unavailable/error falls back to raw rows so the platform aggregates.
   querySpec?: QuerySpec;
+  // Phase 1 SQL-passthrough: the platform-translated DuckDB SQL (references the
+  // __agent_src__ view). When present AND DuckDB is available the agent registers the
+  // file as that view and runs the SQL verbatim — DuckDB as a local drop-in for the
+  // platform's pg-temp executor, covering shapes the querySpec can't express
+  // (compound value-maps, canonical _cid dims, …). Any DuckDB-unavailable/error →
+  // raw fallback. See docs/duckdb-sql-passthrough-plan.md.
+  sqlPassthrough?: {
+    sql: string;
+    expectedFileSig?: string;  // staleness guard, same as aggregationSpec/querySpec
+  };
 }
 
 interface QueryResponse {
@@ -536,7 +546,16 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // value. Now reads from process.env.AGENT_VERSION (set by the sidecar
           // before this server starts). Throws if unset — see version.ts.
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ status: 'ok', version: getAgentVersion() }));
+          res.end(JSON.stringify({
+            status: 'ok',
+            version: getAgentVersion(),
+            // Capability handshake: the platform only routes SQL-passthrough to agents
+            // that advertise it (also echoed per-query in _diag.supportsSqlPassthrough +
+            // pushdownContractVersion:3). DuckDB presence is required to actually run it.
+            supportsSqlPassthrough: true,
+            pushdownContractVersion: 3,
+            duckdbAvailable: isDuckdbAvailable(),
+          }));
           return;
         }
 
@@ -581,6 +600,57 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // Apply filters
           rows = applyFilters(rows, query.filters);
           const filteredRows = rows.length;
+
+          // ── Agent DuckDB SQL-passthrough (Phase 1) ────────────────────────
+          // The platform sends the REAL Cube.js measure/dim SQL, translated to DuckDB
+          // (pg-to-duckdb.js). We register the file as the __agent_src__ view and run
+          // it — DuckDB as a local drop-in for the platform's pg-temp executor, covering
+          // shapes the querySpec can't (compound value-maps, canonical _cid dims, …).
+          // The result is byte-validated vs the pg-temp baseline by the platform shadow
+          // before any serve; ANY DuckDB-unavailable / error → raw fallback (never wrong).
+          const sp = query.sqlPassthrough;
+          if (sp && typeof sp.sql === 'string' && sp.sql.trim()) {
+            const src = loaded.rows;
+            const send = (r: QueryResponse) => {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(r));
+            };
+            // Staleness guard — file changed since the platform proved this shape.
+            if (sp.expectedFileSig && sp.expectedFileSig !== fileSig) {
+              send({
+                data: [], totalRows: src.length, columns: [], aggregationApplied: false,
+                agentVersion: getAgentVersion(), pushdownContractVersion: 3,
+                _diag: { totalSourceRows: src.length, sigMismatch: true, fileSig, cacheHit, engine: 'duckdb-sql', supportsSqlPassthrough: true },
+              });
+              return;
+            }
+            let outRows: Record<string, unknown>[] | null = null;
+            let sqlError = '';
+            try {
+              outRows = await runPassthroughSql(sp.sql, filePath);
+            } catch (e) {
+              sqlError = e instanceof Error ? e.message : String(e);
+              console.warn('[query] DuckDB sql_passthrough failed — raw fallback:', sqlError.substring(0, 160));
+            }
+            if (outRows) {
+              send({
+                data: outRows, totalRows: src.length, columns: inferColumns(outRows),
+                aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: 3,
+                _diag: { totalSourceRows: src.length, fileSig, cacheHit, engine: 'duckdb-sql', groupCount: outRows.length, supportsSqlPassthrough: true },
+              });
+              return;
+            }
+            // DuckDB unavailable or errored → RAW (unfiltered) rows so the PLATFORM
+            // applies its own filters + aggregates the full set (single source of truth),
+            // mirroring the querySpec fallback. aggregationApplied:false → the platform
+            // never records a shadow result from this (no false proof / no false divergence).
+            send({
+              data: src, totalRows: src.length, columns: inferColumns(src),
+              aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: 3,
+              _diag: { totalSourceRows: src.length, fileSig, cacheHit, engine: 'js-fallback', duckdbAvailable: isDuckdbAvailable(), supportsSqlPassthrough: true, ...(sqlError ? { sqlError: sqlError.substring(0, 200) } : {}) },
+            });
+            return;
+          }
 
           // ── Agent DuckDB pushdown (contractVersion 2) ─────────────────────
           // A neutral query-spec (filters + group-by + aggregations + date_trunc)
