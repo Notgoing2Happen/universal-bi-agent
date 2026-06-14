@@ -72,7 +72,6 @@ jobs:
             ### What's New
             - Desktop agent for local file sync and data bridging
             - Real-time folder watching with automatic sync
-            - AI-powered column mapping
             - System tray with sync notifications
           draft: false
           prerelease: false
