@@ -24,7 +24,7 @@ import * as path from 'path';
 import { loadState, computeFileHash } from './state';
 import { loadConfig } from './config';
 import { getOrLoadParsedRows } from './file-cache';
-import { runSpec, runSpecWithCounters, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
+import { runSpec, runSpecWithCounters, runRealignmentVerdict, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
 import type { SpecCounters } from './duckdb-engine';
 import type { QuerySpec } from './query-spec';
 import {
@@ -556,6 +556,11 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             supportsSqlPassthrough: true,
             pushdownContractVersion: 3,
             duckdbAvailable: isDuckdbAvailable(),
+            // Phase-1 (observe-only): agent computes a column-integrity verdict in DuckDB
+            // when the platform sends `profiles` on a querySpec. The platform compares it to
+            // the raw-row realigner; it gates NO serve yet. Capability-gated so the platform
+            // only ships profiles to agents that emit the verdict.
+            supportsRealignmentCheck: true,
           }));
           return;
         }
@@ -574,6 +579,32 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: `File not found: ${filePath}` }));
             return;
+          }
+
+          // ── Phase-1 column-integrity verdict (OBSERVE-ONLY) ───────────────────────────
+          // When the platform ships per-column profiles on a querySpec, compute a DuckDB
+          // realignment verdict (own-fit / shift-evidence over the warm file table) and stamp
+          // it into the response _diag. The platform COMPARES it to the raw-row realigner; it
+          // gates NO serve until proven to agree. SUB-CAP ONLY: that's where a raw-row Node
+          // realigner baseline also exists, so the comparison is meaningful (big files have no
+          // baseline to compare against in Phase 1). Engine-path only (no CLI) → 'unverified'
+          // when the engine is down. Never throws into the query path.
+          let realignDiag: Record<string, number | boolean | string> = {};
+          if (query.querySpec?.profiles && query.querySpec.profiles.length) {
+            let subCap = true;
+            try { subCap = fs.statSync(filePath).size <= getMaxFileSize(); } catch { /* default subCap true */ }
+            if (subCap) {
+              try {
+                const v = await runRealignmentVerdict(query.querySpec.profiles, filePath);
+                realignDiag = {
+                  realignmentChecked: v.checked,
+                  realignmentVerdict: v.verdict,
+                  realignmentTotalRows: v.totalRows,
+                  realignmentMinOwnFrac: Number(v.minOwnFrac.toFixed(4)),
+                  realignmentMaxShiftFrac: Number(v.maxShiftFrac.toFixed(4)),
+                };
+              } catch { realignDiag = { realignmentChecked: false, realignmentVerdict: 'unverified' }; }
+            }
           }
 
           // ── Phase 3: large DuckDB-readable files (gated by AGENT_DUCKDB_LARGE_FILES) ──
@@ -654,6 +685,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                   ...(isLargeFile ? { largeFile: true } : { enginePushdown: true }),
                   fileBytes, fileSig: sig, engine: engineName, groupCount: fpRows.length,
                   ...(isSp ? { supportsSqlPassthrough: true } : {}),
+                  ...realignDiag,
                 };
                 if (fpCounters) {
                   diag.totalSourceRows = fpCounters.totalSourceRows;
@@ -801,7 +833,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
               send({
                 data: duckRows, totalRows: src.length, columns: inferColumns(duckRows),
                 aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: 2,
-                _diag: { ...counters, engine: 'duckdb', groupCount: duckRows.length },
+                _diag: { ...counters, ...realignDiag, engine: 'duckdb', groupCount: duckRows.length },
               });
               return;
             }
@@ -815,7 +847,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             send({
               data: src, totalRows: src.length, columns: inferColumns(src),
               aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: 2,
-              _diag: { ...counters, engine: 'js-fallback', duckdbAvailable: isDuckdbAvailable() },
+              _diag: { ...counters, ...realignDiag, engine: 'js-fallback', duckdbAvailable: isDuckdbAvailable() },
             });
             return;
           }

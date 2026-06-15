@@ -29,7 +29,7 @@ import * as path from 'path';
 import * as http from 'http';
 import { spawn } from 'child_process';
 import { getConfigDir } from './config';
-import type { QuerySpec, SpecAggregation, SpecFilter, SpecDateTrunc } from './query-spec';
+import type { QuerySpec, SpecAggregation, SpecFilter, SpecDateTrunc, SpecColumnProfile } from './query-spec';
 
 type Rows = Record<string, unknown>[];
 
@@ -500,6 +500,123 @@ export async function runSpecWithCounters(
   if (!binary) return { rows: null, counters: null };
   const rows = await runDuckdbJson(binary, sql, timeoutMs);
   return { rows, counters: null };
+}
+
+// ── Column-integrity verification IN DuckDB (Phase 1: OBSERVE-ONLY) ─────────────
+// Reproduces the platform realigner's TWO consumed signals — own-fit (does a
+// column's value match its OWN profile) and shift-evidence (does it match a
+// NEIGHBOR's profile instead) — as COUNT(*) FILTER aggregates over the warm file
+// table, so column-shift can be checked on a big file WITHOUT paging raw rows to
+// Node. The verdict is EMITTED for the platform to COMPARE against the real
+// raw-row realigner; it gates NO serve until that comparison proves agreement
+// (the adversarial review flagged this aggregate as a strict WEAKENING of the
+// JS realigner's score-graded + swap-search algorithm — Phase 1 measures the gap).
+
+export interface RealignmentVerdict {
+  checked: boolean;
+  totalRows: number;
+  minOwnFrac: number;
+  maxShiftFrac: number;
+  verdict: 'aligned' | 'misaligned' | 'unverified';
+}
+
+/** A profile that actually CONSTRAINS values (so a fit/no-fit predicate is meaningful).
+ *  Pure-string/unprofiled columns always-fit → no own-fit failure, no shift evidence. */
+function isConstrainingProfile(p: SpecColumnProfile): boolean {
+  const t = p.expectedType;
+  if (t === 'number' || t === 'integer' || t === 'date' || t === 'datetime' || t === 'boolean') return true;
+  if (p.enumValues && p.enumValues.length) return true;
+  if (p.regex) return true;
+  return false;
+}
+
+/** Boolean "does the VALUE in `col` fit profile `p`" predicate. NULL/blank always fits
+ *  (absence isn't a type violation — mirrors scoreValueAgainstProfile's null handling). */
+function fitsProfilePredicate(col: string, p: SpecColumnProfile): string {
+  const c = quoteIdent(col);
+  const nullish = `${c} IS NULL OR ${c} = ''`;
+  switch (p.expectedType) {
+    case 'number':
+    case 'integer':
+      return `(${nullish} OR TRY_CAST(${c} AS DOUBLE) IS NOT NULL)`;
+    case 'date':
+    case 'datetime':
+      return `(${nullish} OR TRY_CAST(${c} AS TIMESTAMP) IS NOT NULL)`;
+    case 'boolean':
+      return `(${nullish} OR lower(CAST(${c} AS VARCHAR)) IN ('true','false','0','1','t','f','yes','no'))`;
+    default:
+      break; // string/undefined → fall through to enum / regex / always-fit
+  }
+  if (p.enumValues && p.enumValues.length) {
+    return `(${nullish} OR ${c} IN (${p.enumValues.map((v) => quoteLit(String(v))).join(', ')}))`;
+  }
+  if (p.regex) {
+    return `(${nullish} OR regexp_matches(CAST(${c} AS VARCHAR), ${quoteLit(p.regex)}))`;
+  }
+  return 'TRUE';
+}
+
+/** Compile the realignment-verification scan: __rt = COUNT(*); per constraining column i,
+ *  __own_i = rows whose value fits column i's OWN profile; __shift_i = rows whose value does
+ *  NOT fit its own profile but DOES fit an adjacent neighbor's profile (shift evidence). */
+export function compileRealignmentSql(profiles: SpecColumnProfile[], filePath: string): string {
+  const from = buildFromClause(filePath);
+  const cons = (profiles || []).filter(isConstrainingProfile);
+  const profByCol = new Map(cons.map((p) => [p.column, p]));
+  const selects = ['COUNT(*) AS __rt'];
+  cons.forEach((p, i) => {
+    const own = fitsProfilePredicate(p.column, p);
+    selects.push(`COUNT(*) FILTER (WHERE ${own}) AS __own_${i}`);
+    // Shift evidence: this column's value fits a NEIGHBOR's profile (neighbor's rules
+    // applied to THIS column) while NOT fitting its own. Neighbors restricted to those
+    // that themselves carry a constraining profile (only typed columns are shift targets).
+    const neighProfs = (p.neighbors || []).map((n) => profByCol.get(n)).filter(Boolean) as SpecColumnProfile[];
+    if (neighProfs.length) {
+      const fitsNeighbor = neighProfs.map((np) => fitsProfilePredicate(p.column, np)).join(' OR ');
+      selects.push(`COUNT(*) FILTER (WHERE NOT (${own}) AND (${fitsNeighbor})) AS __shift_${i}`);
+    } else {
+      selects.push(`0 AS __shift_${i}`);
+    }
+  });
+  return `SELECT ${selects.join(', ')} FROM ${from}`;
+}
+
+/** Run the realignment scan over the file via the IN-PROCESS engine ONLY (warm table,
+ *  cheap). NEVER the CLI fallback (the documented SEA 2nd/3rd-spawn hang) — on no engine
+ *  the verdict is 'unverified', never blocking. Best-effort: any miss → unverified. */
+export async function runRealignmentVerdict(
+  profiles: SpecColumnProfile[],
+  filePath: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<RealignmentVerdict> {
+  const UNCHECKED: RealignmentVerdict = { checked: false, totalRows: 0, minOwnFrac: 1, maxShiftFrac: 0, verdict: 'unverified' };
+  const cons = (profiles || []).filter(isConstrainingProfile);
+  if (!cons.length) return UNCHECKED;
+  const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
+  let rows: Rows | null = null;
+  try {
+    rows = await runViaRustEngine(compileRealignmentSql(cons, filePath), filePath, timeoutMs);
+  } catch {
+    return UNCHECKED;
+  }
+  if (!rows || !rows.length) return UNCHECKED; // engine unavailable (no port) → unverified, no CLI
+  const r = rows[0] as Record<string, unknown>;
+  const rt = Number(r.__rt) || 0;
+  if (rt === 0) return { checked: true, totalRows: 0, minOwnFrac: 1, maxShiftFrac: 0, verdict: 'unverified' };
+  let minOwn = 1;
+  let maxShift = 0;
+  cons.forEach((_p, i) => {
+    const own = (Number(r[`__own_${i}`]) || 0) / rt;
+    const shift = (Number(r[`__shift_${i}`]) || 0) / rt;
+    if (own < minOwn) minOwn = own;
+    if (shift > maxShift) maxShift = shift;
+  });
+  const ownFloor = Number(process.env.AGENT_REALIGN_OWN_FLOOR || 0.85);
+  const shiftMajority = Number(process.env.AGENT_REALIGN_SHIFT_MAJORITY || 0.5);
+  let verdict: RealignmentVerdict['verdict'] = 'unverified';
+  if (rt >= 5 && maxShift >= shiftMajority) verdict = 'misaligned';
+  else if (minOwn >= ownFloor && maxShift < shiftMajority) verdict = 'aligned';
+  return { checked: true, totalRows: rt, minOwnFrac: minOwn, maxShiftFrac: maxShift, verdict };
 }
 
 /**
