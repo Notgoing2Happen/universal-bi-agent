@@ -306,6 +306,21 @@ export function runDuckdbJson(binary: string, sql: string, timeoutMs = 30000): P
 }
 
 /**
+ * Append an engine MISS (error / parse-fail / POST-error / timeout) + the SQL to a local log file.
+ * The in-process engine's errors were previously swallowed silently (return null → CLI/raw), which
+ * made the shadow-bake fly blind. The agent's stderr is lost in the GUI (no console), so a file in
+ * the config dir is the diagnosable channel. Best-effort; never throws.
+ */
+function logEngineMiss(reason: string, detail: string, sql: string): void {
+  try {
+    const line = `[${new Date().toISOString()}] ${reason}: ${detail.slice(0, 600)} | SQL: ${sql.slice(0, 4000)}\n`;
+    fs.appendFileSync(path.join(getConfigDir(), 'duckdb-engine.log'), line);
+  } catch {
+    /* best effort — diagnostics must never break the query path */
+  }
+}
+
+/**
  * Phase 1 in-process engine bridge: POST the compiled SQL to the Tauri shell's loopback DuckDB
  * server (AGENT_DUCKDB_RPC_PORT) and return the result rows. Resolves to the rows on success, or
  * `null` on ANY miss — engine not running (port unset), connection error, a non-rows response
@@ -344,23 +359,39 @@ export function runViaRustEngine(sql: string, filePath: string, timeoutMs: numbe
         const chunks: Buffer[] = [];
         res.on('data', (d) => chunks.push(d as Buffer));
         res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
           try {
-            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-            // Only a well-formed {rows:[...]} counts; {error} / anything else → CLI fallback.
-            done(parsed && Array.isArray(parsed.rows) ? (parsed.rows as Rows) : null);
-          } catch {
+            const parsed = JSON.parse(raw);
+            if (parsed && Array.isArray(parsed.rows)) {
+              done(parsed.rows as Rows);
+            } else {
+              // Engine returned {error} (or an unexpected shape) → LOG the SQL + error so the cause
+              // is diagnosable, then fall back (null → CLI/raw). Closes the silent-swallow gap.
+              logEngineMiss(
+                'engine-error',
+                typeof parsed?.error === 'string' ? parsed.error : raw.slice(0, 600),
+                sql,
+              );
+              done(null);
+            }
+          } catch (e) {
+            logEngineMiss('parse-fail', `${e instanceof Error ? e.message : String(e)} | body=${raw.slice(0, 300)}`, sql);
             done(null);
           }
         });
       },
     );
-    req.on('error', () => done(null));
+    req.on('error', (err) => {
+      logEngineMiss('post-error', `port=${port} ${err.message}`, sql);
+      done(null);
+    });
     req.setTimeout(timeoutMs, () => {
       try {
         req.destroy();
       } catch {
         /* noop */
       }
+      logEngineMiss('timeout', `${timeoutMs}ms port=${port}`, sql);
       done(null);
     });
     req.write(payload);
