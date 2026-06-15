@@ -106,6 +106,7 @@ function evictIfNeeded(): void {
 export async function getOrLoadParsedRows(
   filePath: string,
   loader: (fp: string) => Promise<Rows>,
+  precomputedSha?: string,
 ): Promise<{ rows: Rows; cacheHit: boolean; sha256?: string }> {
   if (DISABLED) return { rows: await loader(filePath), cacheHit: false };
 
@@ -115,7 +116,13 @@ export async function getOrLoadParsedRows(
   // surfaced as the pushdown `fileSig` so the proven-state + expectedFileSig
   // guard are CONTENT-exact (mtime:size can collide on a same-size edit within
   // one second → a stale serve; the content hash cannot).
-  const sha = await computeFileHash(filePath);
+  // `precomputedSha`: when the engine fast path already hashed this file moments
+  // ago (streaming SHA-256, no parse) and then MISSED, it threads that hash here so
+  // the engine-miss fall-through doesn't read+hash the file a 2nd time. The window is
+  // ≤ the engine timeout (10s) and the chokidar watcher invalidates on change, so a
+  // mid-flight content swap is caught on the NEXT request; the loader still reads the
+  // current file bytes either way — only the cache KEY reuses the fresh-enough hash.
+  const sha = precomputedSha || await computeFileHash(filePath);
 
   const hit = cache.get(key);
   if (hit && hit.sha256 === sha) {

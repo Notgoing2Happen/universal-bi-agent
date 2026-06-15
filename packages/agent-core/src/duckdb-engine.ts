@@ -233,6 +233,46 @@ export function compileSpecToSql(spec: QuerySpec, filePath: string): string {
   return sql;
 }
 
+/** Honesty/diagnostic counters computed in DuckDB (no parallel JS parse). */
+export interface SpecCounters {
+  totalSourceRows: number;
+  filteredRows: number;
+  nullMeasureRows: number;
+}
+
+/**
+ * Compile the honesty counters for a QuerySpec into ONE DuckDB SELECT over the file:
+ *  __t  = totalSourceRows — COUNT(*) over the UNFILTERED file
+ *  __f  = filteredRows    — COUNT(*) under the spec's filters
+ *  __nm = nullMeasureRows — MAX over measures of the count of FILTERED rows whose measure is NULL/''
+ * Pinned to byte-match the JS oracle `countNullMeasureRows` (v == null || v === '', MAX over
+ * measures, over the FILTERED set) so the platform's high_null_rate / silent-drop disclosure
+ * thresholds fire IDENTICALLY to the shadow-proven JS path. Runs ONLY on the warm in-process
+ * engine path (the StoreRegistry table is already materialized → ~free, no re-scan) — never as a
+ * 2nd CLI spawn (that 2nd spawn on the Windows-SEA fan-out path is the documented hang risk).
+ */
+export function compileCountersSql(spec: QuerySpec, filePath: string): string {
+  const from = buildFromClause(filePath);
+  const filters = spec.filters && spec.filters.length ? spec.filters.map(filterExpr).join(' AND ') : '';
+  const filterPred = filters ? `(${filters})` : 'TRUE';
+  // Measure columns the JS oracle inspects: skip COUNT(*)/COUNT(1) (no source column).
+  const measureCols = Array.from(new Set(
+    (spec.aggregations || [])
+      .filter((a) => !(a.type === 'count' && (a.column === '*' || a.column === '1')))
+      .map((a) => a.column),
+  ));
+  const nullExprs = measureCols.map((c) => {
+    const col = quoteIdent(c);
+    // FILTERED rows whose measure is NULL or blank. all_varchar reads a blank cell as NULL, so
+    // `IS NULL OR = ''` reproduces the JS `v == null || v === ''` for both blank and missing.
+    return `COUNT(*) FILTER (WHERE ${filterPred} AND (${col} IS NULL OR ${col} = ''))`;
+  });
+  const nmExpr = nullExprs.length === 0 ? '0'
+    : nullExprs.length === 1 ? nullExprs[0]
+      : `GREATEST(${nullExprs.join(', ')})`;
+  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm FROM ${from}`;
+}
+
 // ── Execution ────────────────────────────────────────────────────────────────
 
 /**
@@ -416,6 +456,50 @@ export async function runSpec(
   const binary = opts.binary || findDuckdbBinary();
   if (!binary) return null;
   return runDuckdbJson(binary, sql, timeoutMs);
+}
+
+/**
+ * Like {@link runSpec}, but ALSO returns the honesty counters
+ * (totalSourceRows / filteredRows / nullMeasureRows) WITHOUT a parallel JS parse — the whole
+ * point of the engine fast path is to avoid loading the file into Node, so the counters that
+ * fed the platform's silent-drop disclosures (formerly from the JS parse) are recomputed in
+ * DuckDB instead. Counters are produced ONLY when the IN-PROCESS engine serves the aggregate (a
+ * 2nd query over the already-warm StoreRegistry table is ~free). On the CLI-fallback path counters
+ * are `null` (caller marks `countersDeferred` — NEVER zeroed) so we never add a 2nd CLI spawn (the
+ * documented Windows-SEA fan-out hang). `rows` is null only when neither engine nor CLI is
+ * available (caller falls back to the raw Node path). A CLI error propagates (caller catches).
+ */
+export async function runSpecWithCounters(
+  spec: QuerySpec,
+  filePath: string,
+  opts: { binary?: string; timeoutMs?: number } = {},
+): Promise<{ rows: Rows | null; counters: SpecCounters | null }> {
+  const sql = compileSpecToSql(spec, filePath);
+  const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
+  const viaRust = await runViaRustEngine(sql, filePath, timeoutMs);
+  if (viaRust !== null) {
+    let counters: SpecCounters | null = null;
+    try {
+      const cRows = await runViaRustEngine(compileCountersSql(spec, filePath), filePath, timeoutMs);
+      if (cRows && cRows.length) {
+        const r = cRows[0] as Record<string, unknown>;
+        counters = {
+          totalSourceRows: Number(r.__t) || 0,
+          filteredRows: Number(r.__f) || 0,
+          nullMeasureRows: Number(r.__nm) || 0,
+        };
+      }
+    } catch {
+      /* counters are best-effort; on any miss the caller marks countersDeferred (never zeroed) */
+    }
+    return { rows: viaRust, counters };
+  }
+  // CLI fallback: a SINGLE spawn, no counters companion (a 2nd spawn on the fan-out hot path is
+  // net-negative + the documented SEA hang). Counters deferred honestly by the caller.
+  const binary = opts.binary || findDuckdbBinary();
+  if (!binary) return { rows: null, counters: null };
+  const rows = await runDuckdbJson(binary, sql, timeoutMs);
+  return { rows, counters: null };
 }
 
 /**

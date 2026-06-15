@@ -21,10 +21,11 @@
 import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
-import { loadState } from './state';
+import { loadState, computeFileHash } from './state';
 import { loadConfig } from './config';
 import { getOrLoadParsedRows } from './file-cache';
-import { runSpec, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
+import { runSpec, runSpecWithCounters, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
+import type { SpecCounters } from './duckdb-engine';
 import type { QuerySpec } from './query-spec';
 import {
   normalizeColumnName,
@@ -585,40 +586,93 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // the user's machine), so a failure here is an HONEST 413 — never a wrong/empty result,
           // never GBs loaded into Node. Off by default until validated end-to-end with a real
           // >cap file; small files / xlsx / no-engine all take the existing path UNCHANGED.
-          if (process.env.AGENT_DUCKDB_LARGE_FILES === 'true') {
+          // Content hash computed on the SUB-cap fast path (reused by the engine-miss
+          // fall-through's getOrLoadParsedRows so the file isn't hashed twice). '' otherwise.
+          let fastPathSha = '';
+          // ── Engine fast path (broadened from the >cap large-file branch) ──────────────
+          // AGENT_DUCKDB_ENGINE_FASTPATH: route ANY DuckDB-readable file through the in-process
+          // engine WITHOUT the whole-file Node load (getOrLoadParsedRows) — the engine scans the
+          // file from disk, so a 22-50MB CSV no longer times out loading into Node. The legacy
+          // AGENT_DUCKDB_LARGE_FILES flag keeps the >cap-ONLY behavior (mtime:size sig, 413 on miss).
+          //   • sub-cap engine MISS → FALL THROUGH to the normal path (lazy Node load + raw
+          //     fallback), reusing the content hash we already computed (no 2nd hash).
+          //   • >cap engine MISS → HONEST 413 (a >cap file cannot be loaded into Node).
+          // xlsx / no-engine / direct-DB (no filePath → handler not invoked) take the path UNCHANGED.
+          const fastPathFlag = process.env.AGENT_DUCKDB_ENGINE_FASTPATH === 'true';
+          if (fastPathFlag || process.env.AGENT_DUCKDB_LARGE_FILES === 'true') {
             const lext = path.extname(filePath).toLowerCase();
             const duckReadable = lext === '.csv' || lext === '.tsv' || lext === '.json' || lext === '.parquet';
             let fileBytes = 0;
             try { fileBytes = fs.statSync(filePath).size; } catch { /* leave 0 */ }
+            const isLargeFile = fileBytes > getMaxFileSize();
+            // Legacy flag alone → preserve the >cap-only gate; fast-path flag → fire for ANY size.
+            const sizeOK = fastPathFlag ? true : isLargeFile;
             const isV2 = !!(query.querySpec && query.querySpec.contractVersion === 2 &&
               Array.isArray(query.querySpec.aggregations) && query.querySpec.aggregations.length > 0);
             const isSp = !!(query.sqlPassthrough && typeof query.sqlPassthrough.sql === 'string' && query.sqlPassthrough.sql.trim());
-            if ((isV2 || isSp) && duckReadable && fileBytes > getMaxFileSize() && isDuckdbAvailable()) {
-              // No Node load → no content hash; fall back to mtime:size for the staleness guard.
-              let lfSig = '';
-              try { const st = fs.statSync(filePath); lfSig = `${Math.round(st.mtimeMs)}:${st.size}`; } catch { /* */ }
+            if ((isV2 || isSp) && duckReadable && sizeOK && isDuckdbAvailable()) {
+              // SIG: a >cap large file keeps mtime:size (legacy distinct contract — never loaded or
+              // hashed; hashing a >cap file would itself be a full read we avoid). A SUB-cap fast-path
+              // serve MUST carry the CONTENT hash, or the platform's shadow same-file guard
+              // (meta.fileSig === fetchSig, where fetchSig is `sha:…`) skips every comparison and the
+              // cube never proves. computeFileHash is a streaming SHA-256 (no parse) — one cheap read.
+              let sig = '';
+              if (isLargeFile) {
+                try { const st = fs.statSync(filePath); sig = `${Math.round(st.mtimeMs)}:${st.size}`; } catch { /* */ }
+              } else {
+                try { fastPathSha = await computeFileHash(filePath); sig = `sha:${fastPathSha}`; }
+                catch { try { const st = fs.statSync(filePath); sig = `${Math.round(st.mtimeMs)}:${st.size}`; } catch { /* */ } }
+              }
               const ver = isSp ? 3 : 2;
-              const sendLF = (r: QueryResponse) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); };
+              const engineName = isSp ? 'duckdb-sql' : 'duckdb';
+              const sendFP = (r: QueryResponse) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); };
+              // Staleness guard — content-exact for sub-cap (sig is `sha:…`); a mismatch means the
+              // file changed since the platform proved this shape → no rows, the platform re-proves.
               const expSig = query.querySpec?.expectedFileSig || query.sqlPassthrough?.expectedFileSig;
-              if (expSig && expSig !== lfSig) {
-                // Changed since proven → sig-mismatch (platform re-fetches/re-proves), no rows.
-                sendLF({ data: [], totalRows: -1, columns: [], aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: { largeFile: true, fileBytes, sigMismatch: true, fileSig: lfSig, engine: isSp ? 'duckdb-sql' : 'duckdb' } });
+              if (expSig && sig && expSig !== sig) {
+                sendFP({ data: [], totalRows: -1, columns: [], aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: { ...(isLargeFile ? { largeFile: true } : { enginePushdown: true }), fileBytes, sigMismatch: true, fileSig: sig, engine: engineName } });
                 return;
               }
-              let lfRows: Record<string, unknown>[] | null = null;
-              let lfErr = '';
+              let fpRows: Record<string, unknown>[] | null = null;
+              let fpCounters: SpecCounters | null = null;
+              let fpErr = '';
               try {
-                lfRows = isSp ? await runPassthroughSql(query.sqlPassthrough!.sql, filePath) : await runSpec(query.querySpec!, filePath);
-              } catch (e) { lfErr = e instanceof Error ? e.message : String(e); }
-              if (lfRows) {
-                sendLF({ data: lfRows, totalRows: -1, columns: inferColumns(lfRows), aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: { largeFile: true, fileBytes, fileSig: lfSig, engine: isSp ? 'duckdb-sql' : 'duckdb', groupCount: lfRows.length } });
+                if (isSp) {
+                  // Passthrough counters aren't derivable from a spec → deferred (parity: today's
+                  // sub-cap passthrough serve already omits filtered/null counters).
+                  fpRows = await runPassthroughSql(query.sqlPassthrough!.sql, filePath);
+                } else if (isLargeFile) {
+                  // >cap: no counters companion (a 2nd COUNT(*) scan of a huge file) — legacy behavior.
+                  fpRows = await runSpec(query.querySpec!, filePath);
+                } else {
+                  const r = await runSpecWithCounters(query.querySpec!, filePath);
+                  fpRows = r.rows; fpCounters = r.counters;
+                }
+              } catch (e) { fpErr = e instanceof Error ? e.message : String(e); }
+              if (fpRows) {
+                const diag: Record<string, number | boolean | string> = {
+                  ...(isLargeFile ? { largeFile: true } : { enginePushdown: true }),
+                  fileBytes, fileSig: sig, engine: engineName, groupCount: fpRows.length,
+                  ...(isSp ? { supportsSqlPassthrough: true } : {}),
+                };
+                if (fpCounters) {
+                  diag.totalSourceRows = fpCounters.totalSourceRows;
+                  diag.filteredRows = fpCounters.filteredRows;
+                  diag.nullMeasureRows = fpCounters.nullMeasureRows;
+                } else {
+                  diag.countersDeferred = true;
+                }
+                sendFP({ data: fpRows, totalRows: fpCounters ? fpCounters.totalSourceRows : -1, columns: inferColumns(fpRows), aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: diag });
                 return;
               }
-              // Could not aggregate a large file (engine miss/error). We CANNOT load it into Node
-              // (OOM) and the platform has no other path to a local agent file → fail HONESTLY.
-              res.writeHead(413, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: `File too large to aggregate (${fileBytes} bytes) and the DuckDB engine could not process it${lfErr ? ': ' + lfErr.slice(0, 160) : ''}.` }));
-              return;
+              // Engine miss/error. >cap → HONEST 413 (cannot load into Node). Sub-cap → FALL THROUGH
+              // to the normal path below (getOrLoadParsedRows + raw fallback), reusing fastPathSha.
+              if (isLargeFile) {
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `File too large to aggregate (${fileBytes} bytes) and the DuckDB engine could not process it${fpErr ? ': ' + fpErr.slice(0, 160) : ''}.` }));
+                return;
+              }
+              if (fpErr) console.warn('[query] engine fast-path miss — falling through to Node load:', fpErr.slice(0, 160));
             }
           }
 
@@ -636,7 +690,9 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // READ-ONLY: `rows` may be a SHARED cached array — consumers below
           // (applyFilters/applyAggregations/projection/slice) all return new
           // arrays/objects and never mutate it in place. Keep it that way.
-          const loaded = await getOrLoadParsedRows(filePath, loadFileData);
+          // `fastPathSha` is set only when the sub-cap engine fast path hashed this file and then
+          // missed → reuse it so we don't read+hash a 2nd time (loader still reads current bytes).
+          const loaded = await getOrLoadParsedRows(filePath, loadFileData, fastPathSha || undefined);
           let rows = loaded.rows;
           const cacheHit = loaded.cacheHit;
           const totalRows = rows.length;
