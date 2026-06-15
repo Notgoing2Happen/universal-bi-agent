@@ -30,6 +30,8 @@ import * as http from 'http';
 import { spawn } from 'child_process';
 import { getConfigDir } from './config';
 import type { QuerySpec, SpecAggregation, SpecFilter, SpecDateTrunc, SpecColumnProfile } from './query-spec';
+import { realignRows } from './integrity/realigner-runtime';
+import type { ValueProfile, RealignBatchSummary, RealignBatchOptions } from './integrity/realigner-runtime';
 
 type Rows = Record<string, unknown>[];
 
@@ -617,6 +619,116 @@ export async function runRealignmentVerdict(
   if (rt >= 5 && maxShift >= shiftMajority) verdict = 'misaligned';
   else if (minOwn >= ownFloor && maxShift < shiftMajority) verdict = 'aligned';
   return { checked: true, totalRows: rt, minOwnFrac: minOwn, maxShiftFrac: maxShift, verdict };
+}
+
+// ── EXACT realigner over DuckDB-streamed batches (self-verify serve path) ──────
+// Run the BYTE-IDENTICAL platform realigner (vendored, src/integrity) over rows
+// STREAMED from the warm DuckDB table in bounded batches — verified per-row +
+// batch-additive, so the streamed summary == a full-load summary. This is the
+// exact graded-score + swap-search realigner, NOT the cheap own-fit SQL proxy
+// (runRealignmentVerdict, which stays Phase-1-observe-only). No whole-file Node
+// load: DuckDB holds the rows, Node sees one batch at a time.
+
+export interface StreamOpts {
+  /** rows per keyset batch (default AGENT_REALIGN_STREAM_BATCH=5000) */
+  batchSize?: number;
+  /** per-batch engine call timeout (default PUSHDOWN_DUCKDB_TIMEOUT_MS) */
+  timeoutMs?: number;
+  /** wall-clock budget across ALL batches (default AGENT_REALIGN_STREAM_BUDGET_MS=12000); exceed → incomplete */
+  budgetMs?: number;
+}
+
+/**
+ * Stream the warm table to `onBatch` in KEYSET batches (`WHERE rowid > :last`,
+ * O(n) total — NOT the O(n²) LIMIT/OFFSET anti-pattern). Returns true iff the
+ * WHOLE table was streamed cleanly; false on ANY incompleteness — engine miss,
+ * budget exceeded, or rowid unusable (e.g. a >cap file DuckDB direct-scans where
+ * rowid isn't a stable base-table column) — so the caller never trusts a partial
+ * pass. rowid is the warm base table's stable insertion-order pseudo-column
+ * (src_<hash> is an append-only CTAS — no deletes, re-materialized byte-identical).
+ */
+async function streamWarmBatches(
+  filePath: string,
+  opts: StreamOpts,
+  onBatch: (rows: Rows) => void,
+): Promise<boolean> {
+  const from = buildFromClause(filePath);
+  const batch = opts.batchSize ?? Number(process.env.AGENT_REALIGN_STREAM_BATCH || 5000);
+  const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
+  const budgetMs = opts.budgetMs ?? Number(process.env.AGENT_REALIGN_STREAM_BUDGET_MS || 12000);
+  const t0 = Date.now();
+  let lastRid = -1;
+  for (;;) {
+    if (Date.now() - t0 > budgetMs) return false; // budget exceeded → incomplete (not verified)
+    const sql = `SELECT *, rowid AS __rid FROM ${from} WHERE rowid > ${lastRid} ORDER BY rowid LIMIT ${batch}`;
+    let rows: Rows | null;
+    try {
+      rows = await runViaRustEngine(sql, filePath, timeoutMs);
+    } catch {
+      return false; // engine error → incomplete
+    }
+    if (rows === null) return false; // engine unavailable (no port / CLI not used here) → incomplete
+    if (rows.length === 0) return true; // clean end (empty file or past the last row)
+    const rid = Number((rows[rows.length - 1] as Record<string, unknown>).__rid);
+    if (!Number.isFinite(rid) || rid <= lastRid) return false; // rowid unusable / non-monotonic → bail safe
+    lastRid = rid;
+    onBatch(rows);
+    if (rows.length < batch) return true; // last partial batch → clean end
+  }
+}
+
+function freshRealignSummary(): RealignBatchSummary {
+  return {
+    total: 0, aligned: 0, realigned: 0, quarantined: 0, suspectedShift: 0,
+    realignedByKind: { shiftOnly: 0, swapOnly: 0, shiftPlusSwap: 0 },
+    realignmentExamples: [], quarantineExamples: [],
+  };
+}
+
+/** Add a per-batch summary into the accumulator (counters add; examples concat to `cap`).
+ *  realignRows' summary is purely additive across disjoint row partitions, so this
+ *  reconstructs the full-load summary exactly. */
+function mergeRealignSummary(acc: RealignBatchSummary, b: RealignBatchSummary, cap: number): void {
+  acc.total += b.total;
+  acc.aligned += b.aligned;
+  acc.realigned += b.realigned;
+  acc.quarantined += b.quarantined;
+  acc.suspectedShift += b.suspectedShift;
+  acc.realignedByKind.shiftOnly += b.realignedByKind.shiftOnly;
+  acc.realignedByKind.swapOnly += b.realignedByKind.swapOnly;
+  acc.realignedByKind.shiftPlusSwap += b.realignedByKind.shiftPlusSwap;
+  for (const e of b.realignmentExamples) if (acc.realignmentExamples.length < cap) acc.realignmentExamples.push(e);
+  for (const e of b.quarantineExamples) if (acc.quarantineExamples.length < cap) acc.quarantineExamples.push(e);
+}
+
+export interface RealignStreamResult {
+  /** true iff the WHOLE table was realigned within budget on the engine (a usable verdict) */
+  checked: boolean;
+  summary: RealignBatchSummary | null;
+}
+
+/**
+ * Run the EXACT realigner over the warm table, streamed in keyset batches,
+ * accumulating one RealignBatchSummary. `checked:false` (incomplete stream /
+ * no profiles) means the caller must NOT treat the result as verified → no proof.
+ * Engine-path only (streamWarmBatches uses runViaRustEngine; never the CLI).
+ */
+export async function realignStream(
+  profiles: Record<string, ValueProfile | undefined>,
+  columnOrder: string[],
+  filePath: string,
+  opts: StreamOpts & { realignOptions?: Partial<RealignBatchOptions> } = {},
+): Promise<RealignStreamResult> {
+  const profileCount = Object.values(profiles).filter((p) => p != null).length;
+  if (profileCount === 0 || columnOrder.length === 0) return { checked: false, summary: null };
+  const ralOpts: RealignBatchOptions = { quarantineMode: 'keep', exampleCap: 5, ...(opts.realignOptions || {}) };
+  const cap = ralOpts.exampleCap ?? 5;
+  const summary = freshRealignSummary();
+  const complete = await streamWarmBatches(filePath, opts, (rows) => {
+    const part = realignRows(rows, columnOrder, profiles, ralOpts);
+    mergeRealignSummary(summary, part.summary, cap);
+  });
+  return complete ? { checked: true, summary } : { checked: false, summary: null };
 }
 
 /**
