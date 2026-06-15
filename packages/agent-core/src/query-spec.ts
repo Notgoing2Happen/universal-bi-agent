@@ -92,4 +92,15 @@ export interface QuerySpec {
    *  verdict in _diag.realignment*. Only columns with a CONSTRAINING profile are
    *  sent (pure-string columns can't be shift evidence). */
   profiles?: SpecColumnProfile[];
+  /** Self-verify serve path: the FULL platform ValueProfile per source column (keyed by
+   *  column), for running the EXACT vendored realigner over DuckDB-streamed rows. Distinct
+   *  from the distilled `profiles` (which drives only the cheap observe-only SQL proxy):
+   *  the exact `scoreValueAgainstProfile` needs nullRate / primaryType / the patterns object.
+   *  Typed loosely (Record<col, unknown>) to keep this contract decoupled from the vendored
+   *  integrity module; the agent casts each to ValueProfile. */
+  fullProfiles?: Record<string, unknown>;
+  /** Self-verify: the platform's `_v2ShapeSig` for this query. The agent echoes it back in
+   *  _diag.selfVerifyShapeSig so the platform binds the self-verify streak to the EXACT agg
+   *  shape (a SUM proof must not authorize an AVG serve). */
+  selfVerifyShapeSig?: string;
 }

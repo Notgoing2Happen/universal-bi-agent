@@ -30,6 +30,8 @@ import * as http from 'http';
 import { spawn } from 'child_process';
 import { getConfigDir } from './config';
 import type { QuerySpec, SpecAggregation, SpecFilter, SpecDateTrunc, SpecColumnProfile } from './query-spec';
+import { realignRows } from './integrity/realigner-runtime';
+import type { ValueProfile, RealignBatchSummary, RealignBatchOptions } from './integrity/realigner-runtime';
 
 type Rows = Record<string, unknown>[];
 
@@ -238,6 +240,12 @@ export interface SpecCounters {
   totalSourceRows: number;
   filteredRows: number;
   nullMeasureRows: number;
+  /** Self-verify Leg 2 (dirty-cast detector): count of FILTERED rows whose numeric
+   *  measure (sum/avg/min/max source) is present but un-castable to DOUBLE — exactly
+   *  the rows production pg `::NUMERIC` would 22P02-ABORT on while DuckDB TRY_CAST
+   *  silently survives. NONZERO → the served number would diverge from production pg
+   *  → decline self-verify. 0 when no numeric measure. */
+  dirtyCastCount: number;
 }
 
 /**
@@ -270,7 +278,22 @@ export function compileCountersSql(spec: QuerySpec, filePath: string): string {
   const nmExpr = nullExprs.length === 0 ? '0'
     : nullExprs.length === 1 ? nullExprs[0]
       : `GREATEST(${nullExprs.join(', ')})`;
-  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm FROM ${from}`;
+  // Dirty-cast detector (self-verify Leg 2): over the columns that get TRY_CAST'd
+  // (sum/avg/min/max sources — NOT count, NOT *), count FILTERED rows that are present
+  // (non-null, non-blank) but TRY_CAST(... AS DOUBLE) IS NULL — i.e. exactly the values
+  // pg `::NUMERIC` would ABORT on. Summed across measures → any nonzero declines the serve.
+  const castCols = Array.from(new Set(
+    (spec.aggregations || [])
+      .filter((a) => (a.type === 'sum' || a.type === 'avg' || a.type === 'min' || a.type === 'max')
+        && a.column !== '*' && a.column !== '1')
+      .map((a) => a.column),
+  ));
+  const dirtyExprs = castCols.map((c) => {
+    const col = quoteIdent(c);
+    return `COUNT(*) FILTER (WHERE ${filterPred} AND ${col} IS NOT NULL AND ${col} <> '' AND TRY_CAST(${col} AS DOUBLE) IS NULL)`;
+  });
+  const dirtyExpr = dirtyExprs.length === 0 ? '0' : dirtyExprs.join(' + ');
+  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm, ${dirtyExpr} AS __dirty FROM ${from}`;
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
@@ -487,6 +510,7 @@ export async function runSpecWithCounters(
           totalSourceRows: Number(r.__t) || 0,
           filteredRows: Number(r.__f) || 0,
           nullMeasureRows: Number(r.__nm) || 0,
+          dirtyCastCount: Number(r.__dirty) || 0,
         };
       }
     } catch {
@@ -617,6 +641,305 @@ export async function runRealignmentVerdict(
   if (rt >= 5 && maxShift >= shiftMajority) verdict = 'misaligned';
   else if (minOwn >= ownFloor && maxShift < shiftMajority) verdict = 'aligned';
   return { checked: true, totalRows: rt, minOwnFrac: minOwn, maxShiftFrac: maxShift, verdict };
+}
+
+// ── EXACT realigner over DuckDB-streamed batches (self-verify serve path) ──────
+// Run the BYTE-IDENTICAL platform realigner (vendored, src/integrity) over rows
+// STREAMED from the warm DuckDB table in bounded batches — verified per-row +
+// batch-additive, so the streamed summary == a full-load summary. This is the
+// exact graded-score + swap-search realigner, NOT the cheap own-fit SQL proxy
+// (runRealignmentVerdict, which stays Phase-1-observe-only). No whole-file Node
+// load: DuckDB holds the rows, Node sees one batch at a time.
+
+export interface StreamOpts {
+  /** rows per keyset batch (default AGENT_REALIGN_STREAM_BATCH=5000) */
+  batchSize?: number;
+  /** per-batch engine call timeout (default PUSHDOWN_DUCKDB_TIMEOUT_MS) */
+  timeoutMs?: number;
+  /** wall-clock budget across ALL batches (default AGENT_REALIGN_STREAM_BUDGET_MS=12000); exceed → incomplete */
+  budgetMs?: number;
+}
+
+/**
+ * Stream the warm table to `onBatch` in KEYSET batches (`WHERE rowid > :last`,
+ * O(n) total — NOT the O(n²) LIMIT/OFFSET anti-pattern). Returns true iff the
+ * WHOLE table was streamed cleanly; false on ANY incompleteness — engine miss,
+ * budget exceeded, or rowid unusable (e.g. a >cap file DuckDB direct-scans where
+ * rowid isn't a stable base-table column) — so the caller never trusts a partial
+ * pass. rowid is the warm base table's stable insertion-order pseudo-column
+ * (src_<hash> is an append-only CTAS — no deletes, re-materialized byte-identical).
+ */
+async function streamWarmBatches(
+  filePath: string,
+  opts: StreamOpts,
+  onBatch: (rows: Rows) => void,
+): Promise<boolean> {
+  const from = buildFromClause(filePath);
+  const batch = opts.batchSize ?? Number(process.env.AGENT_REALIGN_STREAM_BATCH || 5000);
+  const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
+  const budgetMs = opts.budgetMs ?? Number(process.env.AGENT_REALIGN_STREAM_BUDGET_MS || 12000);
+  const t0 = Date.now();
+  let lastRid = -1;
+  for (;;) {
+    if (Date.now() - t0 > budgetMs) return false; // budget exceeded → incomplete (not verified)
+    const sql = `SELECT *, rowid AS __rid FROM ${from} WHERE rowid > ${lastRid} ORDER BY rowid LIMIT ${batch}`;
+    let rows: Rows | null;
+    try {
+      rows = await runViaRustEngine(sql, filePath, timeoutMs);
+    } catch {
+      return false; // engine error → incomplete
+    }
+    if (rows === null) return false; // engine unavailable (no port / CLI not used here) → incomplete
+    if (rows.length === 0) return true; // clean end (empty file or past the last row)
+    const rid = Number((rows[rows.length - 1] as Record<string, unknown>).__rid);
+    if (!Number.isFinite(rid) || rid <= lastRid) return false; // rowid unusable / non-monotonic → bail safe
+    lastRid = rid;
+    onBatch(rows);
+    if (rows.length < batch) return true; // last partial batch → clean end
+  }
+}
+
+function freshRealignSummary(): RealignBatchSummary {
+  return {
+    total: 0, aligned: 0, realigned: 0, quarantined: 0, suspectedShift: 0,
+    realignedByKind: { shiftOnly: 0, swapOnly: 0, shiftPlusSwap: 0 },
+    realignmentExamples: [], quarantineExamples: [],
+  };
+}
+
+/** Add a per-batch summary into the accumulator (counters add; examples concat to `cap`).
+ *  realignRows' summary is purely additive across disjoint row partitions, so this
+ *  reconstructs the full-load summary exactly. */
+function mergeRealignSummary(acc: RealignBatchSummary, b: RealignBatchSummary, cap: number): void {
+  acc.total += b.total;
+  acc.aligned += b.aligned;
+  acc.realigned += b.realigned;
+  acc.quarantined += b.quarantined;
+  acc.suspectedShift += b.suspectedShift;
+  acc.realignedByKind.shiftOnly += b.realignedByKind.shiftOnly;
+  acc.realignedByKind.swapOnly += b.realignedByKind.swapOnly;
+  acc.realignedByKind.shiftPlusSwap += b.realignedByKind.shiftPlusSwap;
+  for (const e of b.realignmentExamples) if (acc.realignmentExamples.length < cap) acc.realignmentExamples.push(e);
+  for (const e of b.quarantineExamples) if (acc.quarantineExamples.length < cap) acc.quarantineExamples.push(e);
+}
+
+export interface RealignStreamResult {
+  /** true iff the WHOLE table was realigned within budget on the engine (a usable verdict) */
+  checked: boolean;
+  summary: RealignBatchSummary | null;
+}
+
+/**
+ * Run the EXACT realigner over the warm table, streamed in keyset batches,
+ * accumulating one RealignBatchSummary. `checked:false` (incomplete stream /
+ * no profiles) means the caller must NOT treat the result as verified → no proof.
+ * Engine-path only (streamWarmBatches uses runViaRustEngine; never the CLI).
+ */
+export async function realignStream(
+  profiles: Record<string, ValueProfile | undefined>,
+  columnOrder: string[],
+  filePath: string,
+  opts: StreamOpts & { realignOptions?: Partial<RealignBatchOptions> } = {},
+): Promise<RealignStreamResult> {
+  const profileCount = Object.values(profiles).filter((p) => p != null).length;
+  if (profileCount === 0 || columnOrder.length === 0) return { checked: false, summary: null };
+  const ralOpts: RealignBatchOptions = { quarantineMode: 'keep', exampleCap: 5, ...(opts.realignOptions || {}) };
+  const cap = ralOpts.exampleCap ?? 5;
+  const summary = freshRealignSummary();
+  const complete = await streamWarmBatches(filePath, opts, (rows) => {
+    const part = realignRows(rows, columnOrder, profiles, ralOpts);
+    mergeRealignSummary(summary, part.summary, cap);
+  });
+  return complete ? { checked: true, summary } : { checked: false, summary: null };
+}
+
+// ── Self-verify orchestration: realign (Leg 3) + JS reference agg (Leg 1) +
+//    dirty-cast (Leg 2), all on-agent over ONE shared warm-table stream. ──────────
+// Proves "production pg over these exact rows would produce the same number" WITHOUT
+// a per-cube pg-temp baseline (which times out for big files): Leg 1 = the agent's JS
+// reference aggregate == its DuckDB aggregate (the DuckDB SQL faithfully implements the
+// lenient parseFloat||0 semantics); Leg 2 = no present-but-uncastable measure value
+// (else pg ::NUMERIC would abort); Leg 3 = the EXACT realigner finds no column shift.
+// ELIGIBILITY (enforced platform-side, Chunk 5): bare-column measures only (no sentinel/
+// cast/CASE-WHEN) AND plain-dim group-bys (no date_trunc) — the subset where the agent
+// faithfully reproduces production. So the JS group key = COALESCE(col,'') (DuckDB's
+// plain-dim group key); date bucketing is never needed here.
+
+const SELFVERIFY_MAX_GROUP_KEYS = 500000;
+
+interface JsAggState {
+  sum: number; nonNull: number; total: number;
+  min: number; max: number; hasNum: boolean;
+  avgNum: number; avgCnt: number; distinct: Set<string> | null;
+}
+
+/** Streaming JS reference aggregator — per-group running accumulators merged across
+ *  batches (memory = group cardinality, not row count). Byte-matches the verified
+ *  computeAggregate (chunk 3) AND DuckDB's COALESCE(col,'') plain-dim group keys.
+ *  Exported for testing (Leg 1 vs DuckDB). */
+export function makeJsAggAccumulator(spec: QuerySpec) {
+  const groupBy = spec.groupBy || [];
+  const aggs = spec.aggregations || [];
+  const groups = new Map<string, { key: Record<string, unknown>; st: JsAggState[] }>();
+  let capExceeded = false;
+  const keyVal = (v: unknown) => (v == null ? '' : String(v)); // COALESCE(col,'') — DuckDB plain-dim key
+  function accumulate(rows: Rows): void {
+    if (capExceeded) return;
+    for (const row of rows) {
+      const r = row as Record<string, unknown>;
+      const k = groupBy.map((c) => keyVal(r[c])).join(' ');
+      let g = groups.get(k);
+      if (!g) {
+        if (groups.size >= SELFVERIFY_MAX_GROUP_KEYS) { capExceeded = true; return; }
+        const key: Record<string, unknown> = {};
+        for (const c of groupBy) key[c] = keyVal(r[c]);
+        const st: JsAggState[] = aggs.map((a) => ({
+          sum: 0, nonNull: 0, total: 0, min: Infinity, max: -Infinity, hasNum: false,
+          avgNum: 0, avgCnt: 0, distinct: a.type === 'count' && a.distinct ? new Set<string>() : null,
+        }));
+        g = { key, st };
+        groups.set(k, g);
+      }
+      for (let i = 0; i < aggs.length; i++) {
+        const a = aggs[i]; const s = g.st[i]; const v = r[a.column];
+        s.total++;
+        switch (a.type) {
+          case 'sum': s.sum += parseFloat(v as string) || 0; break;
+          case 'count':
+            if (a.column === '*' || a.column === '1') break;
+            if (a.distinct) s.distinct!.add(v == null ? '' : String(v));
+            else if (v != null) s.nonNull++;
+            break;
+          case 'avg': if (v != null && v !== '') { s.avgNum += parseFloat(v as string) || 0; s.avgCnt++; } break;
+          case 'min': case 'max': { const n = parseFloat(v as string); if (!isNaN(n)) { s.hasNum = true; if (n < s.min) s.min = n; if (n > s.max) s.max = n; } break; }
+        }
+      }
+    }
+  }
+  function finalize(): Rows {
+    const out: Rows = [];
+    for (const g of groups.values()) {
+      const r: Record<string, unknown> = { ...g.key };
+      for (let i = 0; i < aggs.length; i++) {
+        const a = aggs[i]; const s = g.st[i];
+        let val: number | null;
+        switch (a.type) {
+          case 'count': val = (a.column === '*' || a.column === '1') ? s.total : (a.distinct ? s.distinct!.size : s.nonNull); break;
+          case 'sum': val = s.sum; break;
+          case 'avg': val = s.avgCnt > 0 ? s.avgNum / s.avgCnt : null; break;
+          case 'min': val = s.hasNum ? s.min : null; break;
+          case 'max': val = s.hasNum ? s.max : null; break;
+          default: val = s.total;
+        }
+        r[a.alias] = val;
+      }
+      out.push(r);
+    }
+    return out;
+  }
+  return { accumulate, finalize, capExceeded: () => capExceeded };
+}
+
+/** Leg 1 comparator: do the JS reference groups match the DuckDB groups? Magnitude-aware
+ *  tolerance (mirrors the platform near()/_compareAggGroups), type-parity, all-alias.
+ *  Exported for testing. */
+export function aggGroupsMatch(jsRows: Rows, duckRows: Rows, spec: QuerySpec): boolean {
+  if (jsRows.length !== duckRows.length) return false;
+  const groupBy = spec.groupBy || [];
+  const aliases = (spec.aggregations || []).map((a) => a.alias);
+  const keyOf = (r: Record<string, unknown>) => groupBy.map((c) => (r[c] == null ? '' : String(r[c]))).join(' ');
+  const dmap = new Map<string, Record<string, unknown>>();
+  for (const d of duckRows) dmap.set(keyOf(d as Record<string, unknown>), d as Record<string, unknown>);
+  for (const j of jsRows) {
+    const jr = j as Record<string, unknown>;
+    const dr = dmap.get(keyOf(jr));
+    if (!dr) return false;
+    for (const al of aliases) {
+      const a = jr[al]; const b = dr[al];
+      if (a == null && b == null) continue;
+      if (a == null || b == null) return false;
+      const na = Number(a); const nb = Number(b);
+      if (!Number.isFinite(na) || !Number.isFinite(nb)) { if (String(a) !== String(b)) return false; continue; }
+      if (Math.abs(na - nb) > 1e-6 + Math.abs(nb) * 1e-12) return false;
+    }
+  }
+  return true;
+}
+
+export interface SelfVerifyResult {
+  /** the shared stream completed within budget on the in-process engine (a usable verdict) */
+  checked: boolean;
+  realignmentClean: boolean;       // Leg 3: realigned===0 && suspectedShift===0
+  aggregateSelfVerified: boolean;  // Leg 1 (jsMatch) && Leg 2 (dirtyCastCount===0)
+  jsMatch: boolean;
+  dirtyCastCount: number;
+  realignSummary: { total: number; aligned: number; realigned: number; quarantined: number; suspectedShift: number } | null;
+  rows: Rows | null;               // the DuckDB-served group rows (to serve once verified)
+  counters: SpecCounters | null;   // totalSourceRows/filteredRows/nullMeasureRows/dirtyCastCount
+}
+
+/**
+ * Run the full on-agent self-verify for a querySpec: the DuckDB aggregate + counters
+ * (incl. Leg-2 dirty-cast), then ONE shared keyset stream feeding both the EXACT realigner
+ * (Leg 3) and the JS reference aggregate (Leg 1). `checked:false` (engine miss / CLI fallback
+ * / incomplete stream / group-cap / no profiles) → the caller records NO proof. Engine-path
+ * only. Bounded by AGENT_REALIGN_STREAM_BUDGET_MS.
+ */
+export async function selfVerifyStream(
+  spec: QuerySpec,
+  fullProfiles: Record<string, ValueProfile | undefined>,
+  filePath: string,
+  opts: StreamOpts = {},
+): Promise<SelfVerifyResult> {
+  const NOT: SelfVerifyResult = {
+    checked: false, realignmentClean: false, aggregateSelfVerified: false,
+    jsMatch: false, dirtyCastCount: 0, realignSummary: null, rows: null, counters: null,
+  };
+  let dResult: { rows: Rows | null; counters: SpecCounters | null };
+  try { dResult = await runSpecWithCounters(spec, filePath); }
+  catch { return NOT; }
+  if (!dResult.rows || !dResult.counters) return NOT; // CLI fallback / engine miss → can't self-verify
+  const duckRows = dResult.rows;
+  const counters = dResult.counters;
+  const profileCount = Object.values(fullProfiles).filter((p) => p != null).length;
+  if (profileCount === 0) return NOT;
+
+  const realignSummary = freshRealignSummary();
+  const jsAgg = makeJsAggAccumulator(spec);
+  const ralOpts: RealignBatchOptions = { quarantineMode: 'keep', exampleCap: 5 };
+  let columnOrder: string[] = [];
+  const complete = await streamWarmBatches(filePath, opts, (rows) => {
+    if (columnOrder.length === 0 && rows.length) {
+      columnOrder = Object.keys(rows[0] as Record<string, unknown>).filter((k) => k !== '__rid');
+    }
+    mergeRealignSummary(realignSummary, realignRows(rows, columnOrder, fullProfiles, ralOpts).summary, 5);
+    jsAgg.accumulate(rows);
+  });
+  if (!complete || jsAgg.capExceeded()) {
+    // Stream couldn't finish (engine miss / >cap direct-scan / group-cap) → NO proof, but the
+    // DuckDB aggregate itself is valid → still return it (flags false; the platform records no
+    // proof and won't serve it under the gate). Don't discard a good aggregate over a verify miss.
+    return {
+      checked: false, realignmentClean: false, aggregateSelfVerified: false, jsMatch: false,
+      dirtyCastCount: counters.dirtyCastCount, realignSummary: null, rows: duckRows, counters,
+    };
+  }
+
+  const jsMatch = aggGroupsMatch(jsAgg.finalize(), duckRows, spec);
+  const realignmentClean = realignSummary.realigned === 0 && realignSummary.suspectedShift === 0;
+  return {
+    checked: true,
+    realignmentClean,
+    aggregateSelfVerified: jsMatch && counters.dirtyCastCount === 0,
+    jsMatch,
+    dirtyCastCount: counters.dirtyCastCount,
+    realignSummary: {
+      total: realignSummary.total, aligned: realignSummary.aligned, realigned: realignSummary.realigned,
+      quarantined: realignSummary.quarantined, suspectedShift: realignSummary.suspectedShift,
+    },
+    rows: duckRows,
+    counters,
+  };
 }
 
 /**

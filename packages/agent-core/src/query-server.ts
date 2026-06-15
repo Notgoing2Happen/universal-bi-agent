@@ -24,8 +24,8 @@ import * as path from 'path';
 import { loadState, computeFileHash } from './state';
 import { loadConfig } from './config';
 import { getOrLoadParsedRows } from './file-cache';
-import { runSpec, runSpecWithCounters, runRealignmentVerdict, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
-import type { SpecCounters } from './duckdb-engine';
+import { runSpec, runSpecWithCounters, runRealignmentVerdict, selfVerifyStream, runPassthroughSql, isDuckdbAvailable } from './duckdb-engine';
+import type { SpecCounters, SelfVerifyResult } from './duckdb-engine';
 import type { QuerySpec } from './query-spec';
 import {
   normalizeColumnName,
@@ -404,7 +404,7 @@ function countNullMeasureRows(
 
 export function applyAggregations(
   rows: Record<string, unknown>[],
-  spec: { groupBy: string[]; aggregations: Array<{ type: string; column: string; alias: string }> },
+  spec: { groupBy: string[]; aggregations: Array<{ type: string; column: string; alias: string; distinct?: boolean }> },
 ): { rows: Record<string, unknown>[]; nullMeasureRows: number } | null {
   const groupBy = spec.groupBy || [];
   const aggs = spec.aggregations || [];
@@ -417,15 +417,35 @@ export function applyAggregations(
 
   const computeAggregate = (
     groupRows: Record<string, unknown>[],
-    agg: { type: string; column: string },
+    agg: { type: string; column: string; distinct?: boolean },
   ): number | null => {
     const get = (r: Record<string, unknown>) => r[agg.column];
     switch (agg.type) {
       case 'count':
         if (agg.column === '*' || agg.column === '1') return groupRows.length;
+        if (agg.distinct) {
+          // COUNT(DISTINCT COALESCE(col,'')) — null AND blank collapse to one '' value
+          // (byte-matches duckdb-engine aggExpr; DuckDB-streamed rows give null for blanks).
+          const seen = new Set<string>();
+          for (const r of groupRows) { const v = get(r); seen.add(v == null ? '' : String(v)); }
+          return seen.size;
+        }
         return groupRows.filter(r => get(r) != null).length;
       case 'sum':
         return groupRows.reduce((s, r) => s + (parseFloat(get(r) as any) || 0), 0);
+      case 'avg': {
+        // Match duckdb-engine aggExpr / platform computeAggregate EXACTLY: over rows where
+        // the value is non-null AND non-blank, sum parseFloat(v)||0 (non-numeric text → 0 in
+        // the numerator) and divide by the COUNT of those rows. Empty group → null. (DuckDB's
+        // bare AVG(TRY_CAST) is WRONG here — it drops non-numeric from BOTH sum and count.)
+        let num = 0;
+        let cnt = 0;
+        for (const r of groupRows) {
+          const v = get(r);
+          if (v != null && v !== '') { num += parseFloat(v as any) || 0; cnt++; }
+        }
+        return cnt > 0 ? num / cnt : null;
+      }
       case 'min': {
         const vals = groupRows.map(r => parseFloat(get(r) as any)).filter(v => !isNaN(v));
         return vals.length > 0 ? Math.min(...vals) : null;
@@ -666,12 +686,29 @@ export function startQueryServer(port: number = 9322): Promise<void> {
               }
               let fpRows: Record<string, unknown>[] | null = null;
               let fpCounters: SpecCounters | null = null;
+              let fpSelfVerify: SelfVerifyResult | null = null;
               let fpErr = '';
+              const selfVerifyOn = process.env.AGENT_DUCKDB_V2_SELFVERIFY === 'true'
+                && !!query.querySpec?.fullProfiles
+                && Object.keys(query.querySpec.fullProfiles).length > 0;
               try {
                 if (isSp) {
                   // Passthrough counters aren't derivable from a spec → deferred (parity: today's
                   // sub-cap passthrough serve already omits filtered/null counters).
                   fpRows = await runPassthroughSql(query.sqlPassthrough!.sql, filePath);
+                } else if (selfVerifyOn) {
+                  // Self-verify serve path: DuckDB aggregate + one shared stream → exact realigner
+                  // (Leg 3) + JS reference agg (Leg 1) + dirty-cast (Leg 2). Runs for sub-cap AND
+                  // warm large files (the stream handles either; >256MB direct-scan → checked:false).
+                  // The platform only sends fullProfiles when building/serving the self-verify streak,
+                  // so the stream cost is platform-gated. Always returns the DuckDB rows to serve.
+                  fpSelfVerify = await selfVerifyStream(
+                    query.querySpec!,
+                    query.querySpec!.fullProfiles as Parameters<typeof selfVerifyStream>[1],
+                    filePath,
+                  );
+                  fpRows = fpSelfVerify.rows;
+                  fpCounters = fpSelfVerify.counters;
                 } else if (isLargeFile) {
                   // >cap: no counters companion (a 2nd COUNT(*) scan of a huge file) — legacy behavior.
                   fpRows = await runSpec(query.querySpec!, filePath);
@@ -693,6 +730,20 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                   diag.nullMeasureRows = fpCounters.nullMeasureRows;
                 } else {
                   diag.countersDeferred = true;
+                }
+                // Self-verify flags (the platform serve gate's self-verify branch reads these).
+                // checked:false (incomplete stream / >cap) → flags stay false → no proof, never wrong.
+                if (fpSelfVerify) {
+                  diag.selfVerifyChecked = fpSelfVerify.checked;
+                  diag.realignmentClean = fpSelfVerify.realignmentClean;
+                  diag.aggregateSelfVerified = fpSelfVerify.aggregateSelfVerified;
+                  diag.dirtyCastCount = fpSelfVerify.dirtyCastCount;
+                  if (query.querySpec?.selfVerifyShapeSig) diag.selfVerifyShapeSig = query.querySpec.selfVerifyShapeSig;
+                  if (fpSelfVerify.realignSummary) {
+                    diag.svRealigned = fpSelfVerify.realignSummary.realigned;
+                    diag.svSuspectedShift = fpSelfVerify.realignSummary.suspectedShift;
+                    diag.svTotal = fpSelfVerify.realignSummary.total;
+                  }
                 }
                 sendFP({ data: fpRows, totalRows: fpCounters ? fpCounters.totalSourceRows : -1, columns: inferColumns(fpRows), aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: diag });
                 return;

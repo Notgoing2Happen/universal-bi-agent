@@ -22,7 +22,8 @@
     "csv-parse": "^6.2.1",
     "stream-chain": "^4.2.2",
     "stream-json": "^3.3.0",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
