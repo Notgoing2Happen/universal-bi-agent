@@ -404,7 +404,7 @@ function countNullMeasureRows(
 
 export function applyAggregations(
   rows: Record<string, unknown>[],
-  spec: { groupBy: string[]; aggregations: Array<{ type: string; column: string; alias: string }> },
+  spec: { groupBy: string[]; aggregations: Array<{ type: string; column: string; alias: string; distinct?: boolean }> },
 ): { rows: Record<string, unknown>[]; nullMeasureRows: number } | null {
   const groupBy = spec.groupBy || [];
   const aggs = spec.aggregations || [];
@@ -417,15 +417,35 @@ export function applyAggregations(
 
   const computeAggregate = (
     groupRows: Record<string, unknown>[],
-    agg: { type: string; column: string },
+    agg: { type: string; column: string; distinct?: boolean },
   ): number | null => {
     const get = (r: Record<string, unknown>) => r[agg.column];
     switch (agg.type) {
       case 'count':
         if (agg.column === '*' || agg.column === '1') return groupRows.length;
+        if (agg.distinct) {
+          // COUNT(DISTINCT COALESCE(col,'')) — null AND blank collapse to one '' value
+          // (byte-matches duckdb-engine aggExpr; DuckDB-streamed rows give null for blanks).
+          const seen = new Set<string>();
+          for (const r of groupRows) { const v = get(r); seen.add(v == null ? '' : String(v)); }
+          return seen.size;
+        }
         return groupRows.filter(r => get(r) != null).length;
       case 'sum':
         return groupRows.reduce((s, r) => s + (parseFloat(get(r) as any) || 0), 0);
+      case 'avg': {
+        // Match duckdb-engine aggExpr / platform computeAggregate EXACTLY: over rows where
+        // the value is non-null AND non-blank, sum parseFloat(v)||0 (non-numeric text → 0 in
+        // the numerator) and divide by the COUNT of those rows. Empty group → null. (DuckDB's
+        // bare AVG(TRY_CAST) is WRONG here — it drops non-numeric from BOTH sum and count.)
+        let num = 0;
+        let cnt = 0;
+        for (const r of groupRows) {
+          const v = get(r);
+          if (v != null && v !== '') { num += parseFloat(v as any) || 0; cnt++; }
+        }
+        return cnt > 0 ? num / cnt : null;
+      }
       case 'min': {
         const vals = groupRows.map(r => parseFloat(get(r) as any)).filter(v => !isNaN(v));
         return vals.length > 0 ? Math.min(...vals) : null;

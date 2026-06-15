@@ -240,6 +240,12 @@ export interface SpecCounters {
   totalSourceRows: number;
   filteredRows: number;
   nullMeasureRows: number;
+  /** Self-verify Leg 2 (dirty-cast detector): count of FILTERED rows whose numeric
+   *  measure (sum/avg/min/max source) is present but un-castable to DOUBLE — exactly
+   *  the rows production pg `::NUMERIC` would 22P02-ABORT on while DuckDB TRY_CAST
+   *  silently survives. NONZERO → the served number would diverge from production pg
+   *  → decline self-verify. 0 when no numeric measure. */
+  dirtyCastCount: number;
 }
 
 /**
@@ -272,7 +278,22 @@ export function compileCountersSql(spec: QuerySpec, filePath: string): string {
   const nmExpr = nullExprs.length === 0 ? '0'
     : nullExprs.length === 1 ? nullExprs[0]
       : `GREATEST(${nullExprs.join(', ')})`;
-  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm FROM ${from}`;
+  // Dirty-cast detector (self-verify Leg 2): over the columns that get TRY_CAST'd
+  // (sum/avg/min/max sources — NOT count, NOT *), count FILTERED rows that are present
+  // (non-null, non-blank) but TRY_CAST(... AS DOUBLE) IS NULL — i.e. exactly the values
+  // pg `::NUMERIC` would ABORT on. Summed across measures → any nonzero declines the serve.
+  const castCols = Array.from(new Set(
+    (spec.aggregations || [])
+      .filter((a) => (a.type === 'sum' || a.type === 'avg' || a.type === 'min' || a.type === 'max')
+        && a.column !== '*' && a.column !== '1')
+      .map((a) => a.column),
+  ));
+  const dirtyExprs = castCols.map((c) => {
+    const col = quoteIdent(c);
+    return `COUNT(*) FILTER (WHERE ${filterPred} AND ${col} IS NOT NULL AND ${col} <> '' AND TRY_CAST(${col} AS DOUBLE) IS NULL)`;
+  });
+  const dirtyExpr = dirtyExprs.length === 0 ? '0' : dirtyExprs.join(' + ');
+  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm, ${dirtyExpr} AS __dirty FROM ${from}`;
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
@@ -489,6 +510,7 @@ export async function runSpecWithCounters(
           totalSourceRows: Number(r.__t) || 0,
           filteredRows: Number(r.__f) || 0,
           nullMeasureRows: Number(r.__nm) || 0,
+          dirtyCastCount: Number(r.__dirty) || 0,
         };
       }
     } catch {
