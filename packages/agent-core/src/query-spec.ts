@@ -55,6 +55,28 @@ export interface SpecOrder {
   dir: 'asc' | 'desc';
 }
 
+/**
+ * Per-column value profile the platform ships so the agent can verify column
+ * integrity (column-shift detection) IN DuckDB over the file, without paging raw
+ * rows back to the platform. A distilled subset of the platform's ValueProfile —
+ * exactly what a DuckDB `fits(col, profile)` predicate needs. DATA, never a DB
+ * reach-back. OBSERVE-ONLY in Phase 1: the agent emits a verdict in _diag; the
+ * platform compares it to the real raw-row realigner and records nothing that
+ * gates a serve until the verdict is proven to agree.
+ */
+export interface SpecColumnProfile {
+  column: string;
+  /** Adjacent source columns in file order — the only columns a shifted value
+   *  could have landed from; used for shift-evidence. */
+  neighbors?: string[];
+  expectedType?: 'number' | 'integer' | 'date' | 'datetime' | 'boolean' | 'string';
+  /** Low-cardinality allowed values (omit for high-cardinality columns). */
+  enumValues?: Array<string | number>;
+  /** From ValueProfile.patterns.customRegex. */
+  regex?: string;
+  numericRange?: { min: number; max: number };
+}
+
 export interface QuerySpec {
   contractVersion: 2;
   groupBy: string[];
@@ -65,4 +87,9 @@ export interface QuerySpec {
   limit?: number;
   /** mtime:size fingerprint the platform proved this cube on — staleness guard. */
   expectedFileSig?: string;
+  /** Phase-1 column-integrity verification (observe-only): when present, the agent
+   *  runs a DuckDB realignment-verification scan over the file and returns the
+   *  verdict in _diag.realignment*. Only columns with a CONSTRAINING profile are
+   *  sent (pure-string columns can't be shift evidence). */
+  profiles?: SpecColumnProfile[];
 }
