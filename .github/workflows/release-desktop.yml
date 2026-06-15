@@ -86,7 +86,11 @@ jobs:
       matrix:
         platform:
           - name: Windows x64
-            runner: windows-latest
+            # PINNED to windows-2022 (VS 2022 / MSVC 14.4x). windows-latest moved to VS18 /
+            # MSVC 14.51, under which libduckdb-sys (bundled DuckDB 1.5.3) fails to compile in
+            # release (cl.exe exit 2 on storage/compression sources). 14.4x builds it clean
+            # (matches local + the macOS builds). Revisit when DuckDB supports 14.51. (2026-06-15)
+            runner: windows-2022
             target: x86_64-pc-windows-msvc
             bundles: msi,nsis
           - name: macOS Intel
