@@ -26,6 +26,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
 import { spawn } from 'child_process';
 import { getConfigDir } from './config';
 import type { QuerySpec, SpecAggregation, SpecFilter, SpecDateTrunc } from './query-spec';
@@ -65,7 +66,9 @@ export function findDuckdbBinary(): string | null {
 }
 
 export function isDuckdbAvailable(): boolean {
-  return findDuckdbBinary() !== null;
+  // The in-process Rust engine (AGENT_DUCKDB_RPC_PORT, set by the Tauri shell) provides DuckDB
+  // even when no CLI binary is present, so advertise the capability when either is available.
+  return !!process.env.AGENT_DUCKDB_RPC_PORT || findDuckdbBinary() !== null;
 }
 
 function safeExists(p: string): boolean {
@@ -303,18 +306,85 @@ export function runDuckdbJson(binary: string, sql: string, timeoutMs = 30000): P
 }
 
 /**
+ * Phase 1 in-process engine bridge: POST the compiled SQL to the Tauri shell's loopback DuckDB
+ * server (AGENT_DUCKDB_RPC_PORT) and return the result rows. Resolves to the rows on success, or
+ * `null` on ANY miss — engine not running (port unset), connection error, a non-rows response
+ * ({error}), malformed body, or timeout — so the caller falls back to the CLI / raw path. NEVER
+ * throws and NEVER returns a partial: a wrong number must never come from a transport hiccup.
+ *
+ * Output parity: the engine renders rows via DuckDB's own `to_json` → byte-identical to the CLI
+ * `-json` path, so the platform shadow gate compares like-for-like.
+ */
+export function runViaRustEngine(sql: string, filePath: string, timeoutMs: number): Promise<Rows | null> {
+  const port = process.env.AGENT_DUCKDB_RPC_PORT;
+  if (!port) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: Rows | null) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    // filePath lets the engine serve from a warm content-hash-keyed table (Phase 2 StoreRegistry);
+    // it rewrites the read_csv call → the warm table. Empty/unknown → engine runs the SQL inline.
+    const payload = JSON.stringify({ sql, filePath });
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: Number(port),
+        path: '/duckdb',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (d) => chunks.push(d as Buffer));
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            // Only a well-formed {rows:[...]} counts; {error} / anything else → CLI fallback.
+            done(parsed && Array.isArray(parsed.rows) ? (parsed.rows as Rows) : null);
+          } catch {
+            done(null);
+          }
+        });
+      },
+    );
+    req.on('error', () => done(null));
+    req.setTimeout(timeoutMs, () => {
+      try {
+        req.destroy();
+      } catch {
+        /* noop */
+      }
+      done(null);
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+/**
  * High-level: compile + run a QuerySpec against a local file via DuckDB.
- * Returns null when no DuckDB binary is available (caller falls back to JS).
+ * Phase 1: prefer the in-process Rust engine; fall back to the CLI; return null only when neither
+ * is available (caller then falls back to JS/raw).
  */
 export async function runSpec(
   spec: QuerySpec,
   filePath: string,
   opts: { binary?: string; timeoutMs?: number } = {},
 ): Promise<Rows | null> {
+  const sql = compileSpecToSql(spec, filePath);
+  const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
+  const viaRust = await runViaRustEngine(sql, filePath, timeoutMs);
+  if (viaRust !== null) return viaRust;
   const binary = opts.binary || findDuckdbBinary();
   if (!binary) return null;
-  const sql = compileSpecToSql(spec, filePath);
-  return runDuckdbJson(binary, sql, opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS);
+  return runDuckdbJson(binary, sql, timeoutMs);
 }
 
 /**
@@ -345,8 +415,6 @@ export async function runPassthroughSql(
   filePath: string,
   opts: { binary?: string; timeoutMs?: number } = {},
 ): Promise<Rows | null> {
-  const binary = opts.binary || findDuckdbBinary();
-  if (!binary) return null;
   const from = buildFromClause(filePath); // throws for xlsx → caller falls back
   // Replace EVERY occurrence of the source placeholder with the file-read clause —
   // BARE (no wrapping parens): a table function takes its alias directly, so
@@ -354,5 +422,11 @@ export async function runPassthroughSql(
   // (Wrapping in parens — `FROM (read_csv_auto(...)) "t"` — is a DuckDB syntax error;
   // verified against the real binary before release.)
   const sql = translatedSql.split(PASSTHROUGH_VIEW).join(from);
-  return runDuckdbJson(binary, sql, opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS);
+  const timeoutMs = opts.timeoutMs ?? PUSHDOWN_DUCKDB_TIMEOUT_MS;
+  // Phase 1: prefer the in-process Rust engine (no CLI spawn); fall back to the CLI on any miss.
+  const viaRust = await runViaRustEngine(sql, filePath, timeoutMs);
+  if (viaRust !== null) return viaRust;
+  const binary = opts.binary || findDuckdbBinary();
+  if (!binary) return null;
+  return runDuckdbJson(binary, sql, timeoutMs);
 }

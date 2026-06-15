@@ -575,6 +575,53 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             return;
           }
 
+          // ── Phase 3: large DuckDB-readable files (gated by AGENT_DUCKDB_LARGE_FILES) ──
+          // getOrLoadParsedRows below loads the WHOLE file into Node memory — that is the real
+          // 50MB ceiling (a big file OOMs the SEA heap). But the in-process DuckDB engine
+          // direct-scans large files from disk (streams, respecting memory_limit → spills). So
+          // when enabled, a pushdown request on a large, DuckDB-readable file SKIPS the Node load
+          // and aggregates via DuckDB directly. Success → the small group set (platform-compatible).
+          // The platform has no alternate path to a LOCAL agent file (it can't pg-temp a file on
+          // the user's machine), so a failure here is an HONEST 413 — never a wrong/empty result,
+          // never GBs loaded into Node. Off by default until validated end-to-end with a real
+          // >cap file; small files / xlsx / no-engine all take the existing path UNCHANGED.
+          if (process.env.AGENT_DUCKDB_LARGE_FILES === 'true') {
+            const lext = path.extname(filePath).toLowerCase();
+            const duckReadable = lext === '.csv' || lext === '.tsv' || lext === '.json' || lext === '.parquet';
+            let fileBytes = 0;
+            try { fileBytes = fs.statSync(filePath).size; } catch { /* leave 0 */ }
+            const isV2 = !!(query.querySpec && query.querySpec.contractVersion === 2 &&
+              Array.isArray(query.querySpec.aggregations) && query.querySpec.aggregations.length > 0);
+            const isSp = !!(query.sqlPassthrough && typeof query.sqlPassthrough.sql === 'string' && query.sqlPassthrough.sql.trim());
+            if ((isV2 || isSp) && duckReadable && fileBytes > getMaxFileSize() && isDuckdbAvailable()) {
+              // No Node load → no content hash; fall back to mtime:size for the staleness guard.
+              let lfSig = '';
+              try { const st = fs.statSync(filePath); lfSig = `${Math.round(st.mtimeMs)}:${st.size}`; } catch { /* */ }
+              const ver = isSp ? 3 : 2;
+              const sendLF = (r: QueryResponse) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); };
+              const expSig = query.querySpec?.expectedFileSig || query.sqlPassthrough?.expectedFileSig;
+              if (expSig && expSig !== lfSig) {
+                // Changed since proven → sig-mismatch (platform re-fetches/re-proves), no rows.
+                sendLF({ data: [], totalRows: -1, columns: [], aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: { largeFile: true, fileBytes, sigMismatch: true, fileSig: lfSig, engine: isSp ? 'duckdb-sql' : 'duckdb' } });
+                return;
+              }
+              let lfRows: Record<string, unknown>[] | null = null;
+              let lfErr = '';
+              try {
+                lfRows = isSp ? await runPassthroughSql(query.sqlPassthrough!.sql, filePath) : await runSpec(query.querySpec!, filePath);
+              } catch (e) { lfErr = e instanceof Error ? e.message : String(e); }
+              if (lfRows) {
+                sendLF({ data: lfRows, totalRows: -1, columns: inferColumns(lfRows), aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: { largeFile: true, fileBytes, fileSig: lfSig, engine: isSp ? 'duckdb-sql' : 'duckdb', groupCount: lfRows.length } });
+                return;
+              }
+              // Could not aggregate a large file (engine miss/error). We CANNOT load it into Node
+              // (OOM) and the platform has no other path to a local agent file → fail HONESTLY.
+              res.writeHead(413, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: `File too large to aggregate (${fileBytes} bytes) and the DuckDB engine could not process it${lfErr ? ': ' + lfErr.slice(0, 160) : ''}.` }));
+              return;
+            }
+          }
+
           // File fingerprint for the platform's pushdown proven-state machine.
           // mtime:size is the FALLBACK; the authoritative value is the parse
           // cache's CONTENT hash (set below) so the fingerprint + the agent's

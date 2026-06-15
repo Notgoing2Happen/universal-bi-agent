@@ -6,6 +6,9 @@ use tauri::Manager;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+// Persistent in-process DuckDB engine (Phase 1): a loopback HTTP bridge the Node sidecar POSTs to.
+mod duckdb_server;
+
 struct SidecarState {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -277,6 +280,20 @@ pub fn run() {
 
             eprintln!("[Tauri] Starting sidecar: {:?}", sidecar_path);
 
+            // Start the in-process DuckDB loopback engine (persistent-DuckDB Phase 1) BEFORE the
+            // sidecar so we can hand it the port. On any failure the sidecar simply won't receive
+            // AGENT_DUCKDB_RPC_PORT and transparently falls back to the DuckDB CLI / raw path.
+            let duckdb_port: Option<u16> = match duckdb_server::start() {
+                Ok(p) => {
+                    eprintln!("[Tauri] DuckDB engine on 127.0.0.1:{}", p);
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("[Tauri] DuckDB engine failed to start (sidecar will use CLI/raw): {}", e);
+                    None
+                }
+            };
+
             // Spawn sidecar with stdio pipes for JSON-RPC
             //
             // Phase 0 (2026-06-07): raise V8 heap from the default ~1.5GB to 2GB
@@ -292,6 +309,11 @@ pub fn run() {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+
+            // Hand the in-process DuckDB engine's loopback port to the sidecar (Phase 1 bridge).
+            if let Some(p) = duckdb_port {
+                cmd.env("AGENT_DUCKDB_RPC_PORT", p.to_string());
+            }
 
             // On Windows, prevent the sidecar from opening a visible console window.
             // CREATE_NO_WINDOW = 0x08000000
