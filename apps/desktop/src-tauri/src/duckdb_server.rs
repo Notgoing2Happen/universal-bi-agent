@@ -49,6 +49,10 @@ struct StoreMeta {
     table: String,
     bytes: u64,
     last_used: u64,
+    /// In-flight queries using this table. Eviction NEVER drops a store with refcount > 0, so a
+    /// concurrent query can't have its table pulled out from under it (hardening — closes the
+    /// eviction-vs-query race that previously degraded to a CLI fallback).
+    refcount: u32,
 }
 struct Registry {
     /// path → (content_hash, size, mtime_nanos) for the stat fast-path.
@@ -172,17 +176,26 @@ fn handle(mut req: Request, conn: &Connection, shared: &Shared) {
     };
     let file_path = v.get("filePath").and_then(|s| s.as_str()).map(str::to_string);
 
-    // Phase 2: if a filePath is supplied, try to serve from a warm table (rewrite the read call).
-    // Any failure to resolve/rewrite → run the SQL AS-IS (Phase 1 inline read) → still correct.
-    let effective_sql = match &file_path {
-        Some(fp) if !fp.is_empty() => match resolve_warm_table(fp, shared) {
-            Some(table) => rewrite_read_to_table(&sql, fp, &table).unwrap_or(sql.clone()),
-            None => sql.clone(),
-        },
-        _ => sql.clone(),
-    };
+    // Phase 2: serve from a warm table when possible (rewrite the read call → table). The store is
+    // PINNED (refcount++) for the query duration so eviction can't drop it mid-query; unpin after.
+    // Any resolve/rewrite miss → run the SQL AS-IS (Phase 1 inline read) → still correct.
+    let mut effective_sql = sql.clone();
+    let mut pinned: Option<u64> = None;
+    if let Some(fp) = file_path.as_deref() {
+        if !fp.is_empty() {
+            if let Some((table, hash)) = resolve_warm_table(fp, shared) {
+                effective_sql = rewrite_read_to_table(&sql, fp, &table).unwrap_or(sql.clone());
+                pinned = Some(hash);
+            }
+        }
+    }
 
-    match run_sql_as_json_array(conn, &effective_sql) {
+    let result = run_sql_as_json_array(conn, &effective_sql);
+    if let Some(hash) = pinned {
+        unpin(shared, hash);
+    }
+
+    match result {
         // Phase 3 IPC contract: refuse to ship an oversized result over the loopback; decline with
         // 200 + {error} → Node falls back to the CLI (which has its own cap) → raw. Never stream GBs.
         Ok(rows_json) if rows_json.len() > shared.response_max_bytes => respond_json(
@@ -212,7 +225,10 @@ fn run_sql_as_json_array(conn: &Connection, sql: &str) -> Result<String, String>
 // ── StoreRegistry resolution ─────────────────────────────────────────────────────
 /// Resolve the warm table for `file_path`, materializing it once if needed. Returns None on any
 /// problem (missing file, unsupported ext, materialize error) → caller runs the SQL inline instead.
-fn resolve_warm_table(file_path: &str, shared: &Shared) -> Option<String> {
+/// Resolve + PIN the warm table for `file_path` (refcount++). Returns `(table, hash)`; the caller
+/// MUST `unpin(hash)` after the query. None → caller runs the SQL inline (large file / unsupported
+/// ext / materialize error).
+fn resolve_warm_table(file_path: &str, shared: &Shared) -> Option<(String, u64)> {
     let (size, mtime) = stat(file_path).ok()?;
 
     // Phase 3 §2c: large files are NOT materialized into RAM. Returning None makes handle() run
@@ -243,13 +259,14 @@ fn resolve_warm_table(file_path: &str, shared: &Shared) -> Option<String> {
         }
     };
 
-    // 2. Warm hit?
+    // 2. Warm hit? Pin it (refcount++) so it can't be evicted while this query runs.
     {
         let mut reg = shared.registry.lock().ok()?;
         let now = reg.tick();
         if let Some(meta) = reg.stores.get_mut(&hash) {
             meta.last_used = now;
-            return Some(meta.table.clone());
+            meta.refcount += 1;
+            return Some((meta.table.clone(), hash));
         }
     }
 
@@ -262,7 +279,8 @@ fn resolve_warm_table(file_path: &str, shared: &Shared) -> Option<String> {
         let now = reg.tick();
         if let Some(meta) = reg.stores.get_mut(&hash) {
             meta.last_used = now;
-            return Some(meta.table.clone());
+            meta.refcount += 1;
+            return Some((meta.table.clone(), hash));
         }
     }
     let table = format!("src_{hash:016x}");
@@ -273,22 +291,36 @@ fn resolve_warm_table(file_path: &str, shared: &Shared) -> Option<String> {
     {
         let mut reg = shared.registry.lock().ok()?;
         let now = reg.tick();
-        reg.stores.insert(hash, StoreMeta { table: table.clone(), bytes: size, last_used: now });
+        // Insert PINNED (refcount=1) for this query, THEN evict — so the table we just built is
+        // never the eviction victim (it's refcount>0).
+        reg.stores.insert(hash, StoreMeta { table: table.clone(), bytes: size, last_used: now, refcount: 1 });
         reg.total_bytes = reg.total_bytes.saturating_add(size);
-        evict_if_needed(&mut reg, &mat, &hash);
+        evict_if_needed(&mut reg, &mat);
     }
-    Some(table)
+    Some((table, hash))
+}
+
+/// Decrement a store's in-flight refcount (called after the query that pinned it completes).
+fn unpin(shared: &Shared, hash: u64) {
+    if let Ok(mut reg) = shared.registry.lock() {
+        if let Some(meta) = reg.stores.get_mut(&hash) {
+            meta.refcount = meta.refcount.saturating_sub(1);
+        }
+    }
 }
 
 /// Byte-budget LRU eviction. Drops least-recently-used tables (never the just-created `keep` hash)
 /// until under budget. A concurrent query on an evicted table errors → that query falls back to
 /// the CLI (safe); refcount-pinning to avoid even that race is Phase 2 hardening.
-fn evict_if_needed(reg: &mut Registry, mat: &Connection, keep: &u64) {
+fn evict_if_needed(reg: &mut Registry, mat: &Connection) {
     while reg.total_bytes > TABLE_BYTE_BUDGET {
+        // Never evict a PINNED table (refcount > 0) — a concurrent query is using it; the
+        // just-materialized table is pinned too, so it's safe here. If every resident store is
+        // pinned, stop (temporary over-budget; `memory_limit` spill prevents OOM).
         let victim = reg
             .stores
             .iter()
-            .filter(|(h, _)| *h != keep)
+            .filter(|(_, m)| m.refcount == 0)
             .min_by_key(|(_, m)| m.last_used)
             .map(|(h, m)| (*h, m.table.clone(), m.bytes));
         let Some((vh, vtable, vbytes)) = victim else { break };
