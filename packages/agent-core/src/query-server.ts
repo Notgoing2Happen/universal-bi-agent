@@ -85,10 +85,18 @@ interface QueryRequest {
   filePath: string;
   columns?: string[];       // Which columns to return (default: all)
   filters?: Array<{
-    column: string;
-    operator: 'equals' | 'notEquals' | 'contains' | 'notContains' | 'startsWith' | 'endsWith' | 'gt' | 'lt' | 'gte' | 'lte' | 'set' | 'notSet';
+    column?: string;  // present for representable filters; ABSENT for a caseWhenSpec value-map filter
+    operator: 'equals' | 'notEquals' | 'contains' | 'notContains' | 'startsWith' | 'notStartsWith' | 'endsWith' | 'notEndsWith' | 'gt' | 'lt' | 'gte' | 'lte' | 'set' | 'notSet';
     value?: string | number;
     values?: Array<string | number>;  // multi-value (IN / any-of)
+    // Streaming value-map (caseWhenSpec) filter: the agent evaluates the AI #7 _cid canonical
+    // value-map per row (a faithful replica of the platform's applyFiltersInMemory caseWhenSpec
+    // branch) so it can early-exit on MATCHED rows. The valueMap arrives as [[rawLowerTrimmed,
+    // canonical], ...] (a Map doesn't JSON-serialize); the streaming branch rehydrates it to a Map
+    // ONCE before the row loop. The platform RE-FILTERS the page with the original caseWhenSpec
+    // (value source-of-truth), so this eval need only be "never stricter" — byte-exact parity is
+    // the simplest guarantee. See docs/streaming-detail-value-map-design.md.
+    caseWhenSpec?: { sourceCol: string; valueMap: Array<[string, string]> | Map<string, string>; everyRowNonNull?: boolean };
   }>;
   limit?: number;
   offset?: number;
@@ -334,12 +342,63 @@ async function loadFileData(filePath: string): Promise<Record<string, unknown>[]
 /**
  * Apply filters to rows.
  */
-function applyFilters(rows: Record<string, unknown>[], filters: QueryRequest['filters']): Record<string, unknown>[] {
+/**
+ * Rehydrate a streaming-detail filter set: convert each value-map (caseWhenSpec) filter's
+ * `valueMap` from its JSON wire form ([[rawLowerTrimmed, canonical], ...]) into a `Map` ONCE,
+ * so the per-row `applyFilters` does a cheap `Map.get()` rather than rebuilding the Map for every
+ * streamed row. Idempotent (a `valueMap` already a Map is left as-is). Representable filters pass
+ * through untouched. Returns a NEW array; never mutates the input.
+ */
+export function rehydrateStreamingFilters(filters: QueryRequest['filters']): QueryRequest['filters'] {
+  if (!filters || filters.length === 0) return filters;
+  return filters.map(f => {
+    if (f.caseWhenSpec && !(f.caseWhenSpec.valueMap instanceof Map)) {
+      return { ...f, caseWhenSpec: { ...f.caseWhenSpec, valueMap: new Map(f.caseWhenSpec.valueMap || []) } };
+    }
+    return f;
+  });
+}
+
+export function applyFilters(rows: Record<string, unknown>[], filters: QueryRequest['filters']): Record<string, unknown>[] {
   if (!filters || filters.length === 0) return rows;
 
   return rows.filter(row => {
     return filters.every(f => {
-      const val = row[f.column];
+      // ── Value-map (caseWhenSpec) filter — BYTE-IDENTICAL to the platform's
+      //    applyFiltersInMemory caseWhenSpec branch (nango-driver.js L5403-5457).
+      //    Evaluate the AI #7 _cid canonical value-map on the RAW source column, then
+      //    compare the canonical-resolved value with the operator. The valueMap is a Map
+      //    after the streaming branch rehydrated it; tolerate an array form defensively
+      //    (built once, not per row, since the rehydrate runs before the loop). ──
+      if (f.caseWhenSpec) {
+        const spec = f.caseWhenSpec;
+        const vm = spec.valueMap instanceof Map ? spec.valueMap : new Map(spec.valueMap || []);
+        const raw = row[spec.sourceCol];
+        let caseResult: string | null;
+        if (raw == null || raw === '') {
+          caseResult = null;
+        } else {
+          const norm = String(raw).trim().toLowerCase();
+          const matched = vm.get(norm);
+          caseResult = matched !== undefined ? matched : (spec.everyRowNonNull ? String(raw) : null);
+        }
+        if (f.operator === 'set') return caseResult !== null && caseResult !== undefined && caseResult !== '';
+        if (f.operator === 'notSet') return caseResult === null || caseResult === undefined || caseResult === '';
+        const cv = caseResult == null ? null : String(caseResult);
+        const fvals = (f.values && f.values.length) ? f.values : (f.value !== undefined ? [f.value] : []);
+        switch (f.operator) {
+          case 'equals':        return cv !== null && fvals.some(x => cv === String(x));
+          case 'notEquals':     return cv === null || !fvals.some(x => cv === String(x));
+          case 'contains':      return cv !== null && fvals.some(x => cv.toLowerCase().includes(String(x).toLowerCase()));
+          case 'notContains':   return cv === null || !fvals.some(x => cv.toLowerCase().includes(String(x).toLowerCase()));
+          case 'startsWith':    return cv !== null && fvals.some(x => cv.toLowerCase().startsWith(String(x).toLowerCase()));
+          case 'notStartsWith': return cv === null || !fvals.some(x => cv.toLowerCase().startsWith(String(x).toLowerCase()));
+          case 'endsWith':      return cv !== null && fvals.some(x => cv.toLowerCase().endsWith(String(x).toLowerCase()));
+          case 'notEndsWith':   return cv === null || !fvals.some(x => cv.toLowerCase().endsWith(String(x).toLowerCase()));
+          default:              return true;  // unknown op against a CASE WHEN → conservative pass (matches platform)
+        }
+      }
+      const val = row[f.column as string];
       // Normalize to a value list (multi-value IN / any-of); ordered ops use vals[0].
       const vals = (f.values && f.values.length) ? f.values : (f.value !== undefined ? [f.value] : []);
       const v0 = vals[0];
@@ -823,7 +882,10 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 && (sdExt === '.csv' || sdExt === '.tsv')) {
               const offset = query.offset || 0;
               const limit = query.limit || 10000;
-              const filters = query.filters;
+              // Rehydrate any value-map (caseWhenSpec) filter's valueMap from its wire form
+              // ([[raw, canonical], ...]) to a Map ONCE — so the per-row applyFilters does a
+              // cheap Map.get() instead of rebuilding the Map for every streamed row.
+              const filters = rehydrateStreamingFilters(query.filters);
               const collected: Record<string, unknown>[] = [];
               let matched = 0;
               for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
