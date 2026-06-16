@@ -246,6 +246,17 @@ export interface SpecCounters {
    *  silently survives. NONZERO → the served number would diverge from production pg
    *  → decline self-verify. 0 when no numeric measure. */
   dirtyCastCount: number;
+  /** Self-verify blank-null divergence detector: count of FILTERED rows where ANY group-key
+   *  column OR any COUNT(DISTINCT) source column is genuinely NULL. The agent's group/distinct
+   *  keys use COALESCE(col,'') (a genuine null and a '' collapse to one '' bucket / one distinct
+   *  value), but production's JS path keys a genuine null as 'Unknown' (a SEPARATE group) and
+   *  excludes null from COUNT(DISTINCT). On CSV/TSV a blank cell is read as NULL by all_varchar
+   *  yet is '' in the production JS parse, so COALESCE→'' MATCHES — no divergence. ONLY genuine
+   *  SQL nulls (read_json_auto JSON `null`, read_parquet typed null, or a ragged short CSV row)
+   *  diverge. The legs can't catch this (the JS oracle uses the SAME COALESCE→'' convention), so
+   *  the caller (selfVerifyStream) ANDs `!(genuineNullFormat && groupBlankNullRows>0)` into
+   *  aggregateSelfVerified, where genuineNullFormat = the file is .json/.parquet. 0 ⇒ no risk. */
+  groupBlankNullRows: number;
 }
 
 /**
@@ -293,7 +304,20 @@ export function compileCountersSql(spec: QuerySpec, filePath: string): string {
     return `COUNT(*) FILTER (WHERE ${filterPred} AND ${col} IS NOT NULL AND ${col} <> '' AND TRY_CAST(${col} AS DOUBLE) IS NULL)`;
   });
   const dirtyExpr = dirtyExprs.length === 0 ? '0' : dirtyExprs.join(' + ');
-  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm, ${dirtyExpr} AS __dirty FROM ${from}`;
+  // Blank-null divergence detector: FILTERED rows where any GROUP-key col OR any
+  // COUNT(DISTINCT) source col is genuinely NULL. The agent keys these via COALESCE(col,'')
+  // (null + '' → one bucket / one distinct value); production keys a genuine null as a SEPARATE
+  // 'Unknown' group and excludes null from COUNT(DISTINCT). On CSV the blank cell is NULL here
+  // but '' in production's JS parse → COALESCE→'' matches (no divergence) — so the caller gates
+  // this counter behind genuineNullFormat (.json/.parquet). Counting it unconditionally here is
+  // cheap + format-agnostic; the format decision lives in selfVerifyStream.
+  const distinctCols = (spec.aggregations || [])
+    .filter((a) => a.type === 'count' && a.distinct && a.column !== '*' && a.column !== '1')
+    .map((a) => a.column);
+  const blankRiskCols = Array.from(new Set([...(spec.groupBy || []), ...distinctCols]));
+  const gbnExpr = blankRiskCols.length === 0 ? '0'
+    : `COUNT(*) FILTER (WHERE ${filterPred} AND (${blankRiskCols.map((c) => `${quoteIdent(c)} IS NULL`).join(' OR ')}))`;
+  return `SELECT COUNT(*) AS __t, COUNT(*) FILTER (WHERE ${filterPred}) AS __f, ${nmExpr} AS __nm, ${dirtyExpr} AS __dirty, ${gbnExpr} AS __gbn FROM ${from}`;
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
@@ -511,6 +535,7 @@ export async function runSpecWithCounters(
           filteredRows: Number(r.__f) || 0,
           nullMeasureRows: Number(r.__nm) || 0,
           dirtyCastCount: Number(r.__dirty) || 0,
+          groupBlankNullRows: Number(r.__gbn) || 0,
         };
       }
     } catch {
@@ -927,10 +952,20 @@ export async function selfVerifyStream(
 
   const jsMatch = aggGroupsMatch(jsAgg.finalize(), duckRows, spec);
   const realignmentClean = realignSummary.realigned === 0 && realignSummary.suspectedShift === 0;
+  // Blank-null divergence gate: the agent's group/distinct keys COALESCE(col,'') a genuine null
+  // into the '' bucket, but production keys a genuine null as a SEPARATE 'Unknown' group and
+  // excludes it from COUNT(DISTINCT). On CSV/TSV a blank cell reads as NULL here yet is '' in the
+  // production JS parse → COALESCE→'' MATCHES (no divergence). Only genuine SQL nulls — read_json
+  // `null`, read_parquet typed null, a ragged short CSV row — diverge. Leg 1 can't catch it (the
+  // JS oracle uses the SAME COALESCE→'' convention, so jsMatch stays true). So gate explicitly:
+  // a .json/.parquet file with ANY null group/distinct key declines the serve → raw path.
+  const ext = path.extname(filePath).toLowerCase();
+  const genuineNullFormat = ext === '.json' || ext === '.parquet';
+  const blankDivergence = genuineNullFormat && counters.groupBlankNullRows > 0;
   return {
     checked: true,
     realignmentClean,
-    aggregateSelfVerified: jsMatch && counters.dirtyCastCount === 0,
+    aggregateSelfVerified: jsMatch && counters.dirtyCastCount === 0 && !blankDivergence,
     jsMatch,
     dirtyCastCount: counters.dirtyCastCount,
     realignSummary: {
