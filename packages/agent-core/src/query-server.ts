@@ -30,6 +30,7 @@ import type { QuerySpec } from './query-spec';
 import {
   normalizeColumnName,
   parseCsvLine,
+  streamCsvRows,
   parseCsvFileBuffered,
   parseJsonFileBuffered,
 } from './parsers';
@@ -118,6 +119,14 @@ interface QueryRequest {
     sql: string;
     expectedFileSig?: string;  // staleness guard, same as aggregationSpec/querySpec
   };
+  // Big-file streaming detail lane: the platform sets this true ONLY when it has gated
+  // the DETAIL query (no aggregation) as streaming-safe — CSV/TSV, NO ORDER BY (the agent
+  // has no `order` field, so the platform owns that decision), and every filter is
+  // representable (sent in `filters`). The agent then streams the file with the SAME parser
+  // the whole-file path uses, applies the filters per row, and early-exits at offset+limit
+  // MATCHED rows — never loading the whole file (bypasses the maxFileSize cap for detail).
+  // See docs/persistent-duckdb-agent-design.md (detail lane). Ignored if any spec is present.
+  streamingDetail?: boolean;
 }
 
 interface QueryResponse {
@@ -767,6 +776,59 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // which would let a changed file serve a stale proven aggregate.
           let fileSig = '';
           try { const fst = fs.statSync(filePath); fileSig = `${Math.round(fst.mtimeMs)}:${fst.size}`; } catch { /* leave empty */ }
+
+          // ── Streaming detail lane (big-file CSV/TSV detail, no spec) ──────────────
+          // The platform sets streamingDetail:true ONLY when it has gated this DETAIL
+          // query as streaming-safe (CSV/TSV, no ORDER BY, all filters representable +
+          // sent in query.filters). We stream the file with streamCsvRows — which shares
+          // buildParser/legacyCoerce with parseCsvFileBuffered, so a streamed row is
+          // BYTE-IDENTICAL (value+type+null) to the whole-file path (proven by
+          // streaming-detail-soundness.test.cjs) — apply the filters per row, skip
+          // `offset` MATCHED rows, collect the next `limit`, and break. Native backpressure
+          // tears down the read on break → early exit, NO whole-file load, so it never calls
+          // getOrLoadParsedRows→enforceFileSizeCap (a >maxFileSize file serves its page
+          // instead of 413). aggregationApplied:false → the platform realigns + treats the
+          // rows as raw, identical to the small-file detail path. CSV/TSV + no-spec only;
+          // JSON/XLSX have no streaming-row coercion path.
+          {
+            const sdExt = path.extname(filePath).toLowerCase();
+            if (query.streamingDetail === true
+                && !query.aggregationSpec && !query.querySpec && !query.sqlPassthrough
+                && (sdExt === '.csv' || sdExt === '.tsv')) {
+              const offset = query.offset || 0;
+              const limit = query.limit || 10000;
+              const filters = query.filters;
+              const collected: Record<string, unknown>[] = [];
+              let matched = 0;
+              for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
+                // Reuse the EXACT whole-file filter semantics (applyFilters) per row.
+                if (filters && filters.length && applyFilters([row], filters).length === 0) continue;
+                if (matched++ < offset) continue;        // skip `offset` MATCHED rows
+                collected.push(row);
+                if (collected.length >= limit) break;    // early exit — tears down the read
+              }
+              let outRows = collected;
+              if (query.columns && query.columns.length > 0) {
+                outRows = collected.map(row => {
+                  const f: Record<string, unknown> = {};
+                  for (const col of query.columns!) if (col in row) f[col] = row[col];
+                  return f;
+                });
+              }
+              const response: QueryResponse = {
+                data: outRows,
+                totalRows: -1, // streamed: whole-file count not read (would defeat the early exit)
+                columns: inferColumns(outRows),
+                aggregationApplied: false,
+                agentVersion: getAgentVersion(),
+                pushdownContractVersion: 1,
+                _diag: { streamingDetail: true, fileSig, returnedRows: outRows.length },
+              };
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(response));
+              return;
+            }
+          }
 
           // Parse file (cached: one parse serves all pages / fan-out cubes /
           // repeat questions; keyed by content hash so any file change busts it).
