@@ -328,6 +328,22 @@ pub fn run() {
                 std::env::var("AGENT_DUCKDB_V2_SELFVERIFY").unwrap_or_else(|_| "true".to_string()),
             );
 
+            // Enable the in-process DuckDB engine fast-path for ANY file size (query-server.ts
+            // `fastPathFlag`). REQUIRED for the self-verify legs to run on SUB-cap files: the legs
+            // (selfVerifyStream) live INSIDE the engine fast-path block, which for a <maxFileSize
+            // file is entered only when this flag is true (otherwise sizeOK=isLargeFile=false →
+            // block skipped → Node load path → legs never run, verdict undefined). Verified live
+            // 2026-06-16: with only SELFVERIFY set, sub-cap shadow verdicts stayed undefined; adding
+            // this flag flipped clean cubes to verified=true (e.g. energy_readings) and correctly
+            // declined dirty ones (employee_expenses dirtyCast=2). Also routes sub-cap aggregations
+            // through the warm StoreRegistry engine (a large perf win: cost totals dropped
+            // ~6-28s → ~2.4s in the same test). Serving stays platform-gated (proven-state +
+            // SELFVERIFY_ENABLED); runViaRustEngine falls back to CLI/Node on any miss. OS-overridable.
+            cmd.env(
+                "AGENT_DUCKDB_ENGINE_FASTPATH",
+                std::env::var("AGENT_DUCKDB_ENGINE_FASTPATH").unwrap_or_else(|_| "true".to_string()),
+            );
+
             // On Windows, prevent the sidecar from opening a visible console window.
             // CREATE_NO_WINDOW = 0x08000000
             #[cfg(target_os = "windows")]
