@@ -33,6 +33,7 @@ import {
   streamCsvRows,
   parseCsvFileBuffered,
   parseJsonFileBuffered,
+  coerceDetailRows,
 } from './parsers';
 import { getAgentVersion } from './version';
 
@@ -118,6 +119,17 @@ interface QueryRequest {
   sqlPassthrough?: {
     sql: string;
     expectedFileSig?: string;  // staleness guard, same as aggregationSpec/querySpec
+  };
+  // B3 DETAIL-passthrough lane: the platform sets this ONLY when it has gated a DETAIL query
+  // (no aggregation) that the streaming lane CAN'T serve — a non-representable filter
+  // (caseWhenSpec/compound) the agent can't apply in-stream but DuckDB runs as real inlined
+  // CASE-WHEN SQL. We run the translated SELECT via runPassthroughSql (all_varchar) and then
+  // coerceDetailRows() it so the page byte-matches the production raw-detail baseline (blank→'',
+  // trim, legacyCoerce). aggregationApplied:true → the page is FINAL (the DuckDB SQL already did
+  // WHERE+LIMIT+OFFSET); the platform serves it verbatim, gated by its ordered byte-exact shadow.
+  detailPassthrough?: {
+    sql: string;
+    expectedFileSig?: string;  // staleness guard
   };
   // Big-file streaming detail lane: the platform sets this true ONLY when it has gated
   // the DETAIL query (no aggregation) as streaming-safe — CSV/TSV, NO ORDER BY (the agent
@@ -670,7 +682,8 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             const isV2 = !!(query.querySpec && query.querySpec.contractVersion === 2 &&
               Array.isArray(query.querySpec.aggregations) && query.querySpec.aggregations.length > 0);
             const isSp = !!(query.sqlPassthrough && typeof query.sqlPassthrough.sql === 'string' && query.sqlPassthrough.sql.trim());
-            if ((isV2 || isSp) && duckReadable && sizeOK && isDuckdbAvailable()) {
+            const isDp = !!(query.detailPassthrough && typeof query.detailPassthrough.sql === 'string' && query.detailPassthrough.sql.trim());
+            if ((isV2 || isSp || isDp) && duckReadable && sizeOK && isDuckdbAvailable()) {
               // SIG: a >cap large file keeps mtime:size (legacy distinct contract — never loaded or
               // hashed; hashing a >cap file would itself be a full read we avoid). A SUB-cap fast-path
               // serve MUST carry the CONTENT hash, or the platform's shadow same-file guard
@@ -683,12 +696,12 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 try { fastPathSha = await computeFileHash(filePath); sig = `sha:${fastPathSha}`; }
                 catch { try { const st = fs.statSync(filePath); sig = `${Math.round(st.mtimeMs)}:${st.size}`; } catch { /* */ } }
               }
-              const ver = isSp ? 3 : 2;
-              const engineName = isSp ? 'duckdb-sql' : 'duckdb';
+              const ver = (isSp || isDp) ? 3 : 2;
+              const engineName = (isSp || isDp) ? 'duckdb-sql' : 'duckdb';
               const sendFP = (r: QueryResponse) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); };
               // Staleness guard — content-exact for sub-cap (sig is `sha:…`); a mismatch means the
               // file changed since the platform proved this shape → no rows, the platform re-proves.
-              const expSig = query.querySpec?.expectedFileSig || query.sqlPassthrough?.expectedFileSig;
+              const expSig = query.querySpec?.expectedFileSig || query.sqlPassthrough?.expectedFileSig || query.detailPassthrough?.expectedFileSig;
               if (expSig && sig && expSig !== sig) {
                 sendFP({ data: [], totalRows: -1, columns: [], aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: ver, _diag: { ...(isLargeFile ? { largeFile: true } : { enginePushdown: true }), fileBytes, sigMismatch: true, fileSig: sig, engine: engineName } });
                 return;
@@ -701,7 +714,13 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 && !!query.querySpec?.fullProfiles
                 && Object.keys(query.querySpec.fullProfiles).length > 0;
               try {
-                if (isSp) {
+                if (isDp) {
+                  // B3 DETAIL page: run the translated SELECT (WHERE+LIMIT+OFFSET already in the SQL),
+                  // then coerceDetailRows so the all_varchar page byte-matches the production raw-detail
+                  // baseline (blank→'', trim, legacyCoerce). The platform's ordered byte-exact shadow
+                  // gates any serve, so a coercion residual (quoted intentional whitespace) only declines.
+                  fpRows = coerceDetailRows(await runPassthroughSql(query.detailPassthrough!.sql, filePath));
+                } else if (isSp) {
                   // Passthrough counters aren't derivable from a spec → deferred (parity: today's
                   // sub-cap passthrough serve already omits filtered/null counters).
                   fpRows = await runPassthroughSql(query.sqlPassthrough!.sql, filePath);
@@ -731,6 +750,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                   ...(isLargeFile ? { largeFile: true } : { enginePushdown: true }),
                   fileBytes, fileSig: sig, engine: engineName, groupCount: fpRows.length,
                   ...(isSp ? { supportsSqlPassthrough: true } : {}),
+                  ...(isDp ? { detailPassthrough: true, supportsSqlPassthrough: true } : {}),
                   ...realignDiag,
                 };
                 if (fpCounters) {
@@ -799,7 +819,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
             let sdBig = false;
             try { sdBig = fs.statSync(filePath).size > getMaxFileSize(); } catch { sdBig = false; }
             if (query.streamingDetail === true && sdBig
-                && !query.aggregationSpec && !query.querySpec && !query.sqlPassthrough
+                && !query.aggregationSpec && !query.querySpec && !query.sqlPassthrough && !query.detailPassthrough
                 && (sdExt === '.csv' || sdExt === '.tsv')) {
               const offset = query.offset || 0;
               const limit = query.limit || 10000;
@@ -902,6 +922,51 @@ export function startQueryServer(port: number = 9322): Promise<void> {
               data: src, totalRows: src.length, columns: inferColumns(src),
               aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: 3,
               _diag: { totalSourceRows: src.length, fileSig, cacheHit, engine: 'js-fallback', duckdbAvailable: isDuckdbAvailable(), supportsSqlPassthrough: true, ...(sqlError ? { sqlError: sqlError.substring(0, 200) } : {}) },
+            });
+            return;
+          }
+
+          // ── Agent DuckDB DETAIL-passthrough (B3, sub-cap) ─────────────────
+          // Mirror of the sp branch for a DETAIL SELECT (no aggregation): run the translated
+          // SELECT, then coerceDetailRows so the all_varchar page byte-matches the production
+          // raw-detail baseline. aggregationApplied:true → the platform serves the page as FINAL
+          // (the SQL did WHERE+LIMIT+OFFSET), gated by its ordered byte-exact shadow. On a DuckDB
+          // miss → raw `src` + aggregationApplied:false so the platform records no shadow result.
+          const dp = query.detailPassthrough;
+          if (dp && typeof dp.sql === 'string' && dp.sql.trim()) {
+            const src = loaded.rows;
+            const send = (r: QueryResponse) => {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(r));
+            };
+            if (dp.expectedFileSig && dp.expectedFileSig !== fileSig) {
+              send({
+                data: [], totalRows: src.length, columns: [], aggregationApplied: false,
+                agentVersion: getAgentVersion(), pushdownContractVersion: 3,
+                _diag: { totalSourceRows: src.length, sigMismatch: true, fileSig, cacheHit, engine: 'duckdb-sql', detailPassthrough: true, supportsSqlPassthrough: true },
+              });
+              return;
+            }
+            let outRows: Record<string, unknown>[] | null = null;
+            let sqlError = '';
+            try {
+              outRows = coerceDetailRows(await runPassthroughSql(dp.sql, filePath));
+            } catch (e) {
+              sqlError = e instanceof Error ? e.message : String(e);
+              console.warn('[query] DuckDB detail_passthrough failed — raw fallback:', sqlError.substring(0, 160));
+            }
+            if (outRows) {
+              send({
+                data: outRows, totalRows: src.length, columns: inferColumns(outRows),
+                aggregationApplied: true, agentVersion: getAgentVersion(), pushdownContractVersion: 3,
+                _diag: { totalSourceRows: src.length, fileSig, cacheHit, engine: 'duckdb-sql', groupCount: outRows.length, detailPassthrough: true, supportsSqlPassthrough: true },
+              });
+              return;
+            }
+            send({
+              data: src, totalRows: src.length, columns: inferColumns(src),
+              aggregationApplied: false, agentVersion: getAgentVersion(), pushdownContractVersion: 3,
+              _diag: { totalSourceRows: src.length, fileSig, cacheHit, engine: 'js-fallback', duckdbAvailable: isDuckdbAvailable(), detailPassthrough: true, supportsSqlPassthrough: true, ...(sqlError ? { sqlError: sqlError.substring(0, 200) } : {}) },
             });
             return;
           }

@@ -80,7 +80,7 @@ export interface StreamCsvOptions {
  * numeric-looking values cast via Number(), 'true'/'false' cast to booleans.
  * Anything else stays a string.
  */
-function legacyCoerce(value: string): string | number | boolean {
+export function legacyCoerce(value: string): string | number | boolean {
   if (value === '') return '';
   const num = Number(value);
   if (!isNaN(num) && value.trim() !== '') return num;
@@ -88,6 +88,37 @@ function legacyCoerce(value: string): string | number | boolean {
   if (lower === 'true') return true;
   if (lower === 'false') return false;
   return value;
+}
+
+/**
+ * Coerce a DuckDB `all_varchar` passthrough page (the B3 detail lane) so it BYTE-MATCHES the
+ * production raw-detail baseline (parseCsvFileBuffered). DuckDB `read_csv(all_varchar=true)`
+ * returns every cell as a string and an EMPTY CSV cell as SQL NULL; csv-parse (buildParser)
+ * uses `trim: true` and reads an empty cell as `''`. So per cell:
+ *   - NULL/undefined → `''`  (matches csv-parse's blank → `''`)
+ *   - else           → legacyCoerce(String(cell).trim())  (matches csv-parse's trim + the
+ *                       identical numeric/boolean coercion)
+ * Empirically byte-identical to parseCsvFileBuffered for ALL real cell types
+ * (numeric int/float/`007`/bigint/`1e3`/`3.0`, boolean `true`/`TRUE`/`false`, blank, ISO-date,
+ * unicode, quoted-comma, padded-UNQUOTED text). The ONLY residual is quoted INTENTIONAL
+ * whitespace (`"  x  "` — csv-parse keeps it via quote-aware trim, this strips it): RARE, and
+ * the platform's ORDERED byte-exact shadow (_compareDetailRows) catches it → that shape
+ * declines to raw → NEVER a wrong serve. This is the detail-passthrough analogue of the
+ * agg-passthrough's already-typed numeric result; it reuses legacyCoerce verbatim (NOT a new
+ * coercion surface). Returns NEW row objects; never mutates the input.
+ */
+export function coerceDetailRows(
+  rows: Record<string, unknown>[] | null,
+): Record<string, unknown>[] | null {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map((row) => {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(row)) {
+      const v = row[k];
+      out[k] = (v === null || v === undefined) ? '' : legacyCoerce(String(v).trim());
+    }
+    return out;
+  });
 }
 
 /**

@@ -20,6 +20,8 @@ export { parseCsvLine } from './csv-line';
 export {
   streamCsvRows,
   parseCsvFileBuffered,
+  legacyCoerce,
+  coerceDetailRows,
   type StreamCsvOptions,
 } from './stream-csv';
 export {
