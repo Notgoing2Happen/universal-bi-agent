@@ -13,7 +13,7 @@
  */
 const assert = require('assert');
 const path = require('path');
-const { compileCountersSql } = require('../dist/duckdb-engine.js');
+const { compileCountersSql, buildFromClause } = require('../dist/duckdb-engine.js');
 
 let pass = 0;
 const ok = (n) => { pass++; console.log('  ✓ ' + n); };
@@ -93,6 +93,20 @@ console.log('blank-null-gate:');
   assert.strictEqual(div('/d/f.json', 1), true, 'JSON with a null group/distinct key → DECLINE');
   assert.strictEqual(div('/d/f.parquet', 3), true, 'Parquet with nulls → DECLINE');
   ok('blankDivergence: only (.json|.parquet) && gbn>0 declines; CSV/clean-JSON serve');
+}
+
+// 8. Ragged-CSV guard: CSV/TSV reads are STRICT (null_padding=false) so a ragged short row
+//    ERRORS (→ self-verify fails → raw path) instead of being null-padded into a divergent ''
+//    bucket. JSON/Parquet reads have no such clause (genuine nulls are handled by the format gate).
+{
+  assert.ok(/null_padding=false/.test(buildFromClause('/d/f.csv')), 'CSV read is strict (null_padding=false)');
+  assert.ok(/null_padding=false/.test(buildFromClause('/d/f.tsv')), 'TSV read is strict (null_padding=false)');
+  assert.ok(/read_csv_auto/.test(buildFromClause('/d/f.csv')) && /all_varchar=true/.test(buildFromClause('/d/f.csv')),
+    'CSV still all_varchar=true');
+  assert.ok(!/null_padding/.test(buildFromClause('/d/f.json')), 'JSON read has no null_padding clause');
+  assert.ok(!/null_padding/.test(buildFromClause('/d/f.parquet')), 'Parquet read has no null_padding clause');
+  assert.throws(() => buildFromClause('/d/f.xlsx'), 'xlsx throws (must be pre-parsed)');
+  ok('buildFromClause: CSV/TSV strict null_padding=false; JSON/Parquet unaffected; xlsx throws');
 }
 
 console.log(`\n${pass} assertions passed.`);

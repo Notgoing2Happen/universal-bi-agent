@@ -99,8 +99,21 @@ function numLit(value: unknown): string {
 export function buildFromClause(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   const lit = quoteLit(filePath);
-  if (ext === '.csv') return `read_csv_auto(${lit}, all_varchar=true, header=true)`;
-  if (ext === '.tsv') return `read_csv_auto(${lit}, all_varchar=true, header=true, delim='\t')`;
+  // null_padding=false (strict): a RAGGED short row (fewer fields than the header) must
+  // ERROR here, NOT be null-padded. A null-padded missing trailing field becomes a SQL NULL
+  // that groupExpr COALESCEs to '' (and COUNT(DISTINCT) counts), whereas production's csv-parse
+  // OMITS the field → undefined → applyAggregation keys it 'Unknown' (separate group) and
+  // excludes it from COUNT(DISTINCT). That is the SAME genuine-null divergence the JSON/Parquet
+  // format gate (selfVerifyStream blankDivergence) catches — but the self-verify legs can't see
+  // it (the JS oracle reads the SAME null-padded DuckDB rows). With null_padding=false a ragged
+  // file errors → self-verify fails (checked:false) → no proof → raw path (which handles ragged
+  // rows correctly). A RECTANGULAR CSV with empty cells is unaffected (every row has the header
+  // count; the empty cell is read as NULL → COALESCE→'' = production '' — already verified safe).
+  // The current DuckDB default already collapses an inconsistent-count file to a single column
+  // (→ binder error → same safe outcome), but pinning null_padding=false makes the intent
+  // explicit and robust against a future default flip to null_padding=true.
+  if (ext === '.csv') return `read_csv_auto(${lit}, all_varchar=true, header=true, null_padding=false)`;
+  if (ext === '.tsv') return `read_csv_auto(${lit}, all_varchar=true, header=true, delim='\t', null_padding=false)`;
   if (ext === '.json') return `read_json_auto(${lit})`;
   if (ext === '.parquet') return `read_parquet(${lit})`;
   throw new Error(`duckdb-engine: unsupported file type "${ext}" (xlsx must be pre-parsed into a temp table)`);
