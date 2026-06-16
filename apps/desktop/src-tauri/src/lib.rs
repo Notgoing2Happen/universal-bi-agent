@@ -315,6 +315,19 @@ pub fn run() {
                 cmd.env("AGENT_DUCKDB_RPC_PORT", p.to_string());
             }
 
+            // Enable the self-verify legs (Leg 1 JS-oracle / Leg 2 dirty-cast / Leg 3 realigner)
+            // in the sidecar's query path (query-server.ts `selfVerifyOn`). WITHOUT this the
+            // sidecar never runs the legs → the platform's self-verify shadow records every shape
+            // verified=false → no shape ever proves → the big-file self-verify SERVE (incl. the
+            // canonical "cost by vendor" projection) never engages, only the raw path. The legs are
+            // still platform-gated: the sidecar runs them ONLY when the platform sends fullProfiles
+            // (i.e. AGENT_DUCKDB_V2_SELFVERIFY_SHADOW/_ENABLED is on platform-side), so defaulting
+            // this on here is safe. An explicit OS-env value overrides (set =false to disable).
+            cmd.env(
+                "AGENT_DUCKDB_V2_SELFVERIFY",
+                std::env::var("AGENT_DUCKDB_V2_SELFVERIFY").unwrap_or_else(|_| "true".to_string()),
+            );
+
             // On Windows, prevent the sidecar from opening a visible console window.
             // CREATE_NO_WINDOW = 0x08000000
             #[cfg(target_os = "windows")]

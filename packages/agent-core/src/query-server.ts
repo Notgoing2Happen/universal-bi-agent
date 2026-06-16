@@ -792,7 +792,13 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // JSON/XLSX have no streaming-row coercion path.
           {
             const sdExt = path.extname(filePath).toLowerCase();
-            if (query.streamingDetail === true
+            // Stream ONLY when the file is over the whole-file load cap — a sub-cap file
+            // keeps the cached-load path (shared parse cache across fan-out/pages + a real
+            // totalRows). The platform may hint streamingDetail for any size (it can't see
+            // the agent's file size); the agent decides big-vs-small here.
+            let sdBig = false;
+            try { sdBig = fs.statSync(filePath).size > getMaxFileSize(); } catch { sdBig = false; }
+            if (query.streamingDetail === true && sdBig
                 && !query.aggregationSpec && !query.querySpec && !query.sqlPassthrough
                 && (sdExt === '.csv' || sdExt === '.tsv')) {
               const offset = query.offset || 0;
