@@ -147,6 +147,13 @@ interface QueryRequest {
   // MATCHED rows — never loading the whole file (bypasses the maxFileSize cap for detail).
   // See docs/persistent-duckdb-agent-design.md (detail lane). Ignored if any spec is present.
   streamingDetail?: boolean;
+  // Phase B — big-file ORDER BY top-N. When the platform sets this (with streamingDetail), the
+  // streaming branch maintains a bounded top-K heap (K = offset+limit) by these fields instead of a
+  // file-order early-exit, so a >cap file's "ORDER BY x DESC LIMIT n" serves the true top-N in O(K)
+  // memory. The fields are RESOLVED RAW columns the agent's rows actually carry (the platform
+  // resolves the alias → raw col + only sends a sort on a plain raw column; canonical/compound sorts
+  // decline). The platform re-sorts the returned page with applySort (the order source-of-truth).
+  orderBy?: Array<{ field: string; direction: 'asc' | 'desc' }>;
 }
 
 interface QueryResponse {
@@ -357,6 +364,67 @@ export function rehydrateStreamingFilters(filters: QueryRequest['filters']): Que
     }
     return f;
   });
+}
+
+/**
+ * Comparator BYTE-IDENTICAL to the platform's applySort (nango-driver.js applySort), for ONE pair
+ * of rows given resolvedOrder [{field, direction}]. Per field, in order: nulls sort LAST; numeric
+ * (parseFloat) compare if BOTH parse; else String.localeCompare. Returns <0 / 0 / >0. A full tie
+ * (0) is broken by the CALLER on stream index, matching applySort's stable (V8) sort.
+ *
+ * ⚠ localeCompare uses the runtime default locale (identical across our Node runtimes in practice).
+ * It is only reached for non-numeric sort keys; and the PLATFORM RE-SORTS the returned page with
+ * applySort (the order source-of-truth), so this comparator governs only the top-K SELECTION. The
+ * parity test (value-map / top-N) pins selection == applySort byte-for-byte.
+ */
+type OrderSpec = { field: string; direction: 'asc' | 'desc' };
+export function compareByStreamingOrder(a: Record<string, unknown>, b: Record<string, unknown>, order: OrderSpec[]): number {
+  for (const { field, direction } of order) {
+    const aVal = a[field];
+    const bVal = b[field];
+    if (aVal == null && bVal == null) continue;
+    if (aVal == null) return 1;
+    if (bVal == null) return -1;
+    const aNum = parseFloat(aVal as string);
+    const bNum = parseFloat(bVal as string);
+    if (!isNaN(aNum) && !isNaN(bNum)) {
+      if (aNum !== bNum) return direction === 'asc' ? aNum - bNum : bNum - aNum;
+    } else {
+      const cmp = String(aVal).localeCompare(String(bVal));
+      if (cmp !== 0) return direction === 'asc' ? cmp : -cmp;
+    }
+  }
+  return 0;
+}
+
+/**
+ * Bounded top-K selector (a max-heap keeping the K rows that rank FIRST by compareByStreamingOrder
+ * + a stream-index tie-break). Streams any number of rows in O(rows·log K) time and O(K) memory —
+ * so a >cap file's ORDER BY top-N never loads the whole file. The full comparator (order then index)
+ * makes the boundary selection STABLE, identical to applySort's stable sort (so a tie at the Nth/N+1th
+ * row keeps the SAME row the platform would). `result()` returns the kept rows sorted best-first; the
+ * streaming branch then slices [offset, offset+limit]. The platform re-sorts the page (idempotent).
+ */
+export class BoundedTopK {
+  private k: number;
+  private order: OrderSpec[];
+  private h: Array<{ row: Record<string, unknown>; idx: number }> = [];
+  constructor(k: number, order: OrderSpec[]) { this.k = Math.max(0, k | 0); this.order = order; }
+  // full comparator: <0 if x ranks BEFORE y (order, then earlier stream index wins ties).
+  private cmp(x: { row: Record<string, unknown>; idx: number }, y: { row: Record<string, unknown>; idx: number }): number {
+    const c = compareByStreamingOrder(x.row, y.row, this.order);
+    return c !== 0 ? c : (x.idx - y.idx);
+  }
+  offer(row: Record<string, unknown>, idx: number): void {
+    if (this.k === 0) return;
+    const e = { row, idx };
+    if (this.h.length < this.k) { this.h.push(e); this.up(this.h.length - 1); }
+    else if (this.cmp(e, this.h[0]) < 0) { this.h[0] = e; this.down(0); } // e better than the worst (root) → evict root
+  }
+  // MAX-heap: the root is the WORST (ranks last) of the kept K — the eviction candidate.
+  private up(i: number): void { while (i > 0) { const p = (i - 1) >> 1; if (this.cmp(this.h[i], this.h[p]) > 0) { [this.h[i], this.h[p]] = [this.h[p], this.h[i]]; i = p; } else break; } }
+  private down(i: number): void { const n = this.h.length; for (;;) { const l = 2 * i + 1, r = 2 * i + 2; let m = i; if (l < n && this.cmp(this.h[l], this.h[m]) > 0) m = l; if (r < n && this.cmp(this.h[r], this.h[m]) > 0) m = r; if (m === i) break; [this.h[i], this.h[m]] = [this.h[m], this.h[i]]; i = m; } }
+  result(): Record<string, unknown>[] { return this.h.slice().sort((a, b) => this.cmp(a, b)).map((e) => e.row); }
 }
 
 export function applyFilters(rows: Record<string, unknown>[], filters: QueryRequest['filters']): Record<string, unknown>[] {
@@ -886,14 +954,34 @@ export function startQueryServer(port: number = 9322): Promise<void> {
               // ([[raw, canonical], ...]) to a Map ONCE — so the per-row applyFilters does a
               // cheap Map.get() instead of rebuilding the Map for every streamed row.
               const filters = rehydrateStreamingFilters(query.filters);
-              const collected: Record<string, unknown>[] = [];
-              let matched = 0;
-              for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
-                // Reuse the EXACT whole-file filter semantics (applyFilters) per row.
-                if (filters && filters.length && applyFilters([row], filters).length === 0) continue;
-                if (matched++ < offset) continue;        // skip `offset` MATCHED rows
-                collected.push(row);
-                if (collected.length >= limit) break;    // early exit — tears down the read
+              const orderBy = Array.isArray(query.orderBy) ? query.orderBy : null;
+              let collected: Record<string, unknown>[];
+              if (orderBy && orderBy.length > 0) {
+                // ── Phase B: ORDER BY top-N — bounded heap, NO early-exit ──
+                // A sorted top-N needs the TRUE top-K across the whole file, so we cannot stop at
+                // offset+limit MATCHED rows (file order ≠ sorted order). Stream every (filtered) row
+                // through a size-(offset+limit) max-heap keyed by compareByStreamingOrder + stream
+                // index (stable, == applySort). O(rows·log K) time, O(K) memory — a >cap file never
+                // loads whole. The platform re-sorts the returned page (applySort) as source of truth.
+                const K = offset + limit;
+                const heap = new BoundedTopK(K, orderBy);
+                let idx = 0;
+                for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
+                  if (filters && filters.length && applyFilters([row], filters).length === 0) continue;
+                  heap.offer(row, idx++);
+                }
+                collected = heap.result().slice(offset, offset + limit);   // sorted top-K, then the page
+              } else {
+                // ── Filter-only detail: file-order early-exit at offset+limit MATCHED rows ──
+                collected = [];
+                let matched = 0;
+                for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
+                  // Reuse the EXACT whole-file filter semantics (applyFilters) per row.
+                  if (filters && filters.length && applyFilters([row], filters).length === 0) continue;
+                  if (matched++ < offset) continue;        // skip `offset` MATCHED rows
+                  collected.push(row);
+                  if (collected.length >= limit) break;    // early exit — tears down the read
+                }
               }
               let outRows = collected;
               if (query.columns && query.columns.length > 0) {
