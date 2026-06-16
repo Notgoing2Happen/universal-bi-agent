@@ -11,7 +11,7 @@
  * Run: node packages/agent-core/__tests__/topn-heap-parity.test.cjs   (after `npm run build`)
  */
 const assert = require('assert');
-const { BoundedTopK, compareByStreamingOrder } = require('../dist/query-server.js');
+const { BoundedTopK, compareByStreamingOrder, isCrossRuntimeSafeSortValue } = require('../dist/query-server.js');
 
 let pass = 0;
 const ok = (n) => { pass++; console.log('  ✓ ' + n); };
@@ -169,6 +169,25 @@ console.log('topn-heap-parity (BoundedTopK vs applySort oracle):');
   assert.ok(compareByStreamingOrder({ a: null }, { a: 2 }, [{ field: 'a', direction: 'asc' }]) > 0, 'null last');
   assert.strictEqual(compareByStreamingOrder({ a: 5 }, { a: 5 }, [{ field: 'a', direction: 'asc' }]), 0, 'equal → 0 (caller breaks)');
   ok('compareByStreamingOrder: asc/desc/nulls-last/tie');
+}
+
+// 11. isCrossRuntimeSafeSortValue — the Phase-B numeric-only guard (closes the TZ + ICU selection
+//     HIGHs from review wjc59qmvv). Numeric/null/blank = SAFE (deterministic everywhere); date-shaped
+//     (TZ-dependent Date.parse) + non-numeric string (ICU-dependent localeCompare) = UNSAFE → bail.
+{
+  // SAFE
+  for (const v of [null, undefined, '', 5, 100.5, -3, '7', '10', '1e3', '  42  ', 0]) {
+    assert.strictEqual(isCrossRuntimeSafeSortValue(v), true, `safe: ${JSON.stringify(v)}`);
+  }
+  // UNSAFE — date-shaped (the TZ risk)
+  for (const v of ['2026-01-09', '2026-01-09T10:00:00', '2026-12-31', '2025-06-15T00:00:00Z']) {
+    assert.strictEqual(isCrossRuntimeSafeSortValue(v), false, `unsafe date: ${JSON.stringify(v)}`);
+  }
+  // UNSAFE — non-numeric string (the ICU risk)
+  for (const v of ['apple', 'Zeta Corp', 'N/A', 'true']) {
+    assert.strictEqual(isCrossRuntimeSafeSortValue(v), false, `unsafe string: ${JSON.stringify(v)}`);
+  }
+  ok('isCrossRuntimeSafeSortValue: numeric/null/blank safe; date-shaped + non-numeric string → unsafe (bail)');
 }
 
 console.log('\n' + pass + ' checks passed.');

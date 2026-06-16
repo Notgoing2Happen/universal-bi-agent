@@ -414,6 +414,22 @@ export function compareByStreamingOrder(a: Record<string, unknown>, b: Record<st
 }
 
 /**
+ * Classify a sort-key value for CROSS-RUNTIME-SAFE streaming top-N selection (Phase B). The agent
+ * (desktop, arbitrary TZ/locale) SELECTS the top-N; the platform (server) re-sorts but cannot
+ * re-select — so the selection comparator must be DETERMINISTIC across runtimes. parseFloat/numeric
+ * is identical everywhere; a date-shaped value (Date.parse is TZ-dependent for tz-less datetimes) or
+ * a non-numeric string (localeCompare is ICU-dependent) is NOT — so those make the agent bail
+ * (orderByNonNumeric) → platform falls back. null/blank are safe (nulls-last, value-independent).
+ * Returns true = SAFE to stream-select; false = UNSAFE (bail). Exported for the parity test.
+ */
+export function isCrossRuntimeSafeSortValue(v: unknown): boolean {
+  if (v === null || v === undefined || v === '') return true;
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return false;   // date-shaped → TZ-dependent
+  return !isNaN(parseFloat(s));                      // non-numeric string → ICU-dependent
+}
+
+/**
  * Bounded top-K selector (a max-heap keeping the K rows that rank FIRST by compareByStreamingOrder
  * + a stream-index tie-break). Streams any number of rows in O(rows·log K) time and O(K) memory —
  * so a >cap file's ORDER BY top-N never loads the whole file. The full comparator (order then index)
@@ -982,25 +998,36 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 const K = offset + limit;
                 const heap = new BoundedTopK(K, orderBy);
                 let idx = 0;
-                let sawSortKey = false;   // did ANY streamed row carry a sort-key column?
+                const fieldSeen = orderBy.map(() => false);   // PER-FIELD presence (not "any field")
+                let unsafeSortKey = false;                     // a date-shaped / non-numeric sort value
                 for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
                   if (filters && filters.length && applyFilters([row], filters).length === 0) continue;
-                  if (!sawSortKey) { for (const o of orderBy) { if (o.field in row) { sawSortKey = true; break; } } }
+                  for (let fi = 0; fi < orderBy.length; fi++) {
+                    if (!(orderBy[fi].field in row)) continue;
+                    fieldSeen[fi] = true;
+                    // SELECTION must be cross-runtime DETERMINISTIC → numeric keys only (parseFloat is
+                    // identical everywhere; date/string compare is TZ/ICU-dependent). Phase B v1 = numeric
+                    // ORDER BY; date/string top-N deferred until TZ/locale are pinned in both runtimes.
+                    if (!unsafeSortKey && !isCrossRuntimeSafeSortValue(row[orderBy[fi].field])) unsafeSortKey = true;
+                  }
                   heap.offer(row, idx++);
                 }
-                if (idx > 0 && !sawSortKey) {
-                  // FIELD-ABSENT GUARD: the ORDER BY column isn't in the data (an alias≠raw mismatch
-                  // the platform's conservative resolver couldn't see). The heap order would be
-                  // meaningless → DON'T serve a bogus top-N. Signal the platform (which has no
-                  // selection backstop) to fail honestly. For a >cap file the raw fallback 413s anyway.
+                const bailStreaming = (diagKey: string) => {
+                  // Fail HONESTLY (no platform selection backstop) — the platform throws / falls back
+                  // (for a >cap file the raw fallback 413s, which is the honest outcome).
                   res.writeHead(200, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({
                     data: [], totalRows: -1, columns: [], aggregationApplied: false,
                     agentVersion: getAgentVersion(), pushdownContractVersion: 1,
-                    _diag: { streamingDetail: true, orderByFieldAbsent: true, fileSig },
+                    _diag: { streamingDetail: true, [diagKey]: true, fileSig },
                   }));
-                  return;
-                }
+                };
+                // FIELD-ABSENT GUARD (PER-FIELD): ANY ordered field absent across ALL rows → the heap
+                // order is bogus for that field (an alias≠raw mismatch, or an absent secondary key). Don't
+                // serve a wrong top-N.
+                if (idx > 0 && fieldSeen.some((seen) => !seen)) { bailStreaming('orderByFieldAbsent'); return; }
+                // NUMERIC-ONLY GUARD: a date/string sort key → cross-runtime (TZ/ICU) selection divergence.
+                if (idx > 0 && unsafeSortKey) { bailStreaming('orderByNonNumeric'); return; }
                 collected = heap.result().slice(offset, offset + limit);   // sorted top-K, then the page
               } else {
                 // ── Filter-only detail: file-order early-exit at offset+limit MATCHED rows ──
@@ -1022,6 +1049,12 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                   return f;
                 });
               }
+              // CAPABILITY ECHO (Phase A safety): when this request carried a value-map (caseWhenSpec)
+              // filter, echo valueMapApplied:true — this build HAS the caseWhenSpec evaluator
+              // (applyFilters branch). An OLD agent lacks this echo, so the platform can refuse to
+              // serve a value-map streamed page unless the echo is present (→ no silent-empty serve
+              // from an old agent that read row[undefined] and dropped every row).
+              const valueMapApplied = !!(filters && filters.some((f) => f && f.caseWhenSpec));
               const response: QueryResponse = {
                 data: outRows,
                 totalRows: -1, // streamed: whole-file count not read (would defeat the early exit)
@@ -1029,7 +1062,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 aggregationApplied: false,
                 agentVersion: getAgentVersion(),
                 pushdownContractVersion: 1,
-                _diag: { streamingDetail: true, fileSig, returnedRows: outRows.length },
+                _diag: { streamingDetail: true, fileSig, returnedRows: outRows.length, ...(valueMapApplied ? { valueMapApplied: true } : {}) },
               };
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(response));
