@@ -19,6 +19,7 @@ const ok = (n) => { pass++; console.log('  ✓ ' + n); };
 // ── ORACLE: applySort verbatim (nango-driver.js applySort comparator) over a stable [V8] sort.
 //    Returns rows sorted; the top-N page = .slice(offset, offset+limit). No explicit tie-break —
 //    relies on V8 sort stability, exactly like applySort. ──
+const ISO_DATE_PREFIX = /^\d{4}-\d{2}-\d{2}/;
 function applySortOracle(rows, order) {
   return [...rows].sort((a, b) => {
     for (const { field, direction } of order) {
@@ -26,6 +27,15 @@ function applySortOracle(rows, order) {
       if (aVal == null && bVal == null) continue;
       if (aVal == null) return 1;
       if (bVal == null) return -1;
+      // B0: ISO-date-aware branch (matches the fixed applySort + compareByStreamingOrder).
+      const aStr = String(aVal), bStr = String(bVal);
+      if (ISO_DATE_PREFIX.test(aStr) || ISO_DATE_PREFIX.test(bStr)) {
+        const aT = Date.parse(aStr), bT = Date.parse(bStr);
+        if (!isNaN(aT) && !isNaN(bT)) {
+          if (aT !== bT) return direction === 'asc' ? aT - bT : bT - aT;
+          continue;
+        }
+      }
       const aNum = parseFloat(aVal), bNum = parseFloat(bVal);
       if (!isNaN(aNum) && !isNaN(bNum)) {
         if (aNum !== bNum) return direction === 'asc' ? aNum - bNum : bNum - aNum;
@@ -111,8 +121,23 @@ console.log('topn-heap-parity (BoundedTopK vs applySort oracle):');
   ok('K = 1 (single top)');
 }
 
+// 8b. B0 DATE SORT: same-year ISO dates must sort CHRONOLOGICALLY (not parseFloat year-only →
+//     insertion order). The legacy bug would tie all 2026 dates; the fixed comparator orders them.
+{
+  const rows = [
+    { d: '2026-12-01', tag: 'dec' }, { d: '2026-01-09', tag: 'jan' },
+    { d: '2025-06-15', tag: 'prevyr' }, { d: '2026-02-15', tag: 'feb' },
+  ];
+  // ASC: 2025-06-15, 2026-01-09, 2026-02-15, 2026-12-01 — chronological, NOT year-then-insertion.
+  const asc = heapTopN(rows, [{ field: 'd', direction: 'asc' }], 0, 4);
+  assert.deepStrictEqual(asc.map(r => r.tag), ['prevyr', 'jan', 'feb', 'dec'], 'B0: ISO dates sort chronologically ASC');
+  assertSamePage(rows, [{ field: 'd', direction: 'desc' }], 0, 2, 'date-desc-top2'); // most-recent two
+  ok('B0: same-year ISO dates sort chronologically (heap == fixed applySort)');
+}
+
 // 9. FUZZ: random data × order × offset × limit. Deterministic LCG (no Math.random — keep it
-//    reproducible). Mixes numeric, numeric-as-string, null, and repeated keys (forces ties).
+//    reproducible). Mixes numeric, numeric-as-string, ISO dates (same-year + cross-year, for the B0
+//    branch + the mixed date/non-date fall-through), null, and repeated keys (forces ties).
 {
   let seed = 0x9e3779b9 >>> 0;
   const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0x100000000; };
@@ -121,7 +146,8 @@ console.log('topn-heap-parity (BoundedTopK vs applySort oracle):');
   for (let t = 0; t < 400; t++) {
     const n = 1 + Math.floor(rnd() * 40);
     const rows = Array.from({ length: n }, (_, i) => {
-      const a = pick([null, 0, 1, 2, 2, 3, 5, 5, 5, '7', '10', '2']); // dupes + numeric-strings + null
+      const a = pick([null, 0, 1, 2, 2, 3, 5, 5, 5, '7', '10', '2',
+        '2026-01-09', '2026-12-01', '2026-02-15', '2025-06-15', '2026-01-09']); // + ISO dates (dupes → ties)
       const b = pick(['x', 'y', 'y', 'z', null, 'Apple', 'apple']);
       return { a, b, _i: i }; // _i makes rows distinguishable so deepEqual checks identity, not just key
     });

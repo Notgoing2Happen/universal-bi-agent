@@ -378,6 +378,9 @@ export function rehydrateStreamingFilters(filters: QueryRequest['filters']): Que
  * parity test (value-map / top-N) pins selection == applySort byte-for-byte.
  */
 type OrderSpec = { field: string; direction: 'asc' | 'desc' };
+// ISO 8601 date prefix (YYYY-MM-DD) — drives the B0 date-aware sort branch. Mirrors the platform's
+// ISO_DATE_PREFIX in applySort / applyFiltersInMemory's orderedCompare.
+const ISO_DATE_PREFIX_SORT = /^\d{4}-\d{2}-\d{2}/;
 export function compareByStreamingOrder(a: Record<string, unknown>, b: Record<string, unknown>, order: OrderSpec[]): number {
   for (const { field, direction } of order) {
     const aVal = a[field];
@@ -385,6 +388,19 @@ export function compareByStreamingOrder(a: Record<string, unknown>, b: Record<st
     if (aVal == null && bVal == null) continue;
     if (aVal == null) return 1;
     if (bVal == null) return -1;
+    // ISO-date-aware (B0): a date-shaped value sorts as a TIMESTAMP, not by parseFloat (year-only).
+    // BYTE-IDENTICAL to the platform applySort's date branch (pinned by topn-heap-parity.test.cjs).
+    const aStr = String(aVal);
+    const bStr = String(bVal);
+    if (ISO_DATE_PREFIX_SORT.test(aStr) || ISO_DATE_PREFIX_SORT.test(bStr)) {
+      const aT = Date.parse(aStr);
+      const bT = Date.parse(bStr);
+      if (!isNaN(aT) && !isNaN(bT)) {
+        if (aT !== bT) return direction === 'asc' ? aT - bT : bT - aT;
+        continue;  // equal timestamps → next field
+      }
+      // one side isn't a parseable date → fall through to the legacy numeric/string compare
+    }
     const aNum = parseFloat(aVal as string);
     const bNum = parseFloat(bVal as string);
     if (!isNaN(aNum) && !isNaN(bNum)) {
@@ -966,9 +982,24 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 const K = offset + limit;
                 const heap = new BoundedTopK(K, orderBy);
                 let idx = 0;
+                let sawSortKey = false;   // did ANY streamed row carry a sort-key column?
                 for await (const row of streamCsvRows(filePath, { delimiter: sdExt === '.tsv' ? '\t' : undefined })) {
                   if (filters && filters.length && applyFilters([row], filters).length === 0) continue;
+                  if (!sawSortKey) { for (const o of orderBy) { if (o.field in row) { sawSortKey = true; break; } } }
                   heap.offer(row, idx++);
+                }
+                if (idx > 0 && !sawSortKey) {
+                  // FIELD-ABSENT GUARD: the ORDER BY column isn't in the data (an alias≠raw mismatch
+                  // the platform's conservative resolver couldn't see). The heap order would be
+                  // meaningless → DON'T serve a bogus top-N. Signal the platform (which has no
+                  // selection backstop) to fail honestly. For a >cap file the raw fallback 413s anyway.
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({
+                    data: [], totalRows: -1, columns: [], aggregationApplied: false,
+                    agentVersion: getAgentVersion(), pushdownContractVersion: 1,
+                    _diag: { streamingDetail: true, orderByFieldAbsent: true, fileSig },
+                  }));
+                  return;
                 }
                 collected = heap.result().slice(offset, offset + limit);   // sorted top-K, then the page
               } else {
