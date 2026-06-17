@@ -431,6 +431,8 @@ async function processRelayQuery(query, config) {
           offset: query.offset,                    // chunked raw-path paging window
           aggregationSpec: query.aggregationSpec,   // Phase 1 agent aggregation pushdown spec
           querySpec: query.querySpec,               // Phase 2/3 contractVersion-2 DuckDB query-spec
+          streamingDetail: query.streamingDetail,   // Phase A/B: stream a >cap file's detail page
+          orderBy: query.orderBy,                   // Phase B: bounded top-N sort fields
         };
 
     console.error(`[Sidecar] Processing relay ${endpoint} query ${query.id}`);
