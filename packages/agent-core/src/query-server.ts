@@ -1055,6 +1055,12 @@ export function startQueryServer(port: number = 9322): Promise<void> {
               // serve a value-map streamed page unless the echo is present (→ no silent-empty serve
               // from an old agent that read row[undefined] and dropped every row).
               const valueMapApplied = !!(filters && filters.some((f) => f && f.caseWhenSpec));
+              // CAPABILITY ECHO (Phase B safety): when this >cap stream carried an ORDER BY, the heap
+              // above computed the TRUE bounded top-N (numeric — the orderByNonNumeric/Field-absent bails
+              // returned earlier). Echo orderByApplied:true so the platform's Path-B gate SERVES it (vs an
+              // old agent that lacks this echo → the platform throws agent_orderby_unsupported, never a
+              // silent first-N serve). Only set when orderBy was actually applied (not the filter-only lane).
+              const orderByApplied = !!(orderBy && orderBy.length > 0);
               const response: QueryResponse = {
                 data: outRows,
                 totalRows: -1, // streamed: whole-file count not read (would defeat the early exit)
@@ -1062,7 +1068,7 @@ export function startQueryServer(port: number = 9322): Promise<void> {
                 aggregationApplied: false,
                 agentVersion: getAgentVersion(),
                 pushdownContractVersion: 1,
-                _diag: { streamingDetail: true, fileSig, returnedRows: outRows.length, ...(valueMapApplied ? { valueMapApplied: true } : {}) },
+                _diag: { streamingDetail: true, fileSig, returnedRows: outRows.length, ...(valueMapApplied ? { valueMapApplied: true } : {}), ...(orderByApplied ? { orderByApplied: true } : {}) },
               };
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(response));
@@ -1088,6 +1094,58 @@ export function startQueryServer(port: number = 9322): Promise<void> {
           // Apply filters
           rows = applyFilters(rows, query.filters);
           const filteredRows = rows.length;
+
+          // ── Phase B sub-cap: ORDER BY top-N over the whole-file set (wf wnjexl3wa BLOCKER-3) ──
+          // The >cap streaming branch (above) handles big files via BoundedTopK and returns early. A
+          // SUB-cap ordered-detail query reaches here with the full file parsed + filtered (`rows`).
+          // We MUST handle the ORDER BY and RETURN our own response BEFORE the file-order slice at the
+          // bottom (L~1320, which does NOT sort) — else the agent ships first-N FILE-order rows and the
+          // platform sorts a wrong subset (the exact bug Path A fixed). Mirrors the >cap lane's guards.
+          if (query.streamingDetail === true && Array.isArray(query.orderBy) && query.orderBy.length > 0
+              && !query.aggregationSpec && !query.querySpec && !query.sqlPassthrough && !query.detailPassthrough) {
+            const sdOrderBy = query.orderBy;
+            const sdOffset = query.offset || 0;                                    // platform declines offset>0 (B1); defensive
+            const sdLimit = query.limit != null ? query.limit : rows.length;       // platform declines null limit (M6); defensive
+            const sdFieldSeen = sdOrderBy.map(() => false);                        // PER-field presence (== >cap lane)
+            let sdUnsafe = false;                                                  // a date-shaped / non-numeric sort value
+            for (const row of rows) {
+              for (let fi = 0; fi < sdOrderBy.length; fi++) {
+                if (!(sdOrderBy[fi].field in row)) continue;
+                sdFieldSeen[fi] = true;
+                // SELECTION must be cross-runtime DETERMINISTIC → numeric keys only (parseFloat identical
+                // everywhere; date/string compare is TZ/ICU-dependent). Matches the >cap guard exactly.
+                if (!sdUnsafe && !isCrossRuntimeSafeSortValue(row[sdOrderBy[fi].field])) sdUnsafe = true;
+              }
+            }
+            const sdProject = (rs: Record<string, unknown>[]) =>
+              (query.columns && query.columns.length > 0)
+                ? rs.map((row) => { const f: Record<string, unknown> = {}; for (const col of query.columns!) if (col in row) f[col] = row[col]; return f; })
+                : rs;
+            const sendSd = (data: Record<string, unknown>[], extraDiag: Record<string, boolean>) => {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                data, totalRows, columns: inferColumns(data), aggregationApplied: false,
+                agentVersion: getAgentVersion(), pushdownContractVersion: 1,
+                _diag: { streamingDetail: true, fileSig, returnedRows: data.length, ...extraDiag },
+              }));
+            };
+            // FIELD-ABSENT → the platform can't sort by it either → honest bail (platform throws
+            // agent_orderby_unsortable). Mirrors the >cap orderByFieldAbsent guard.
+            if (rows.length > 0 && sdFieldSeen.some((s) => !s)) { sendSd([], { orderByFieldAbsent: true }); return; }
+            if (!sdUnsafe) {
+              // NUMERIC-safe → the agent selects the TRUE global top-N. CLONE (MINOR-8): applyFilters with
+              // no filters returns the shared cached parse by reference; an in-place sort would corrupt it.
+              // V8 sort is stable + `rows` is in filtered-file order, so ties match applySort's tie-break.
+              const sdSorted = [...rows].sort((a, b) => compareByStreamingOrder(a, b, sdOrderBy));
+              sendSd(sdProject(sdSorted.slice(sdOffset, sdOffset + sdLimit)), { orderByApplied: true });
+              return;
+            }
+            // DATE/STRING (cross-runtime-unsafe) → DEFER: return ALL filtered rows (projected to
+            // query.columns, which the driver widened to include the sort key) so the driver's applySort +
+            // slice selects the true top-N in ONE runtime. Do NOT slice here.
+            sendSd(sdProject(rows), { orderByDeferred: true });
+            return;
+          }
 
           // ── Agent DuckDB SQL-passthrough (Phase 1) ────────────────────────
           // The platform sends the REAL Cube.js measure/dim SQL, translated to DuckDB
