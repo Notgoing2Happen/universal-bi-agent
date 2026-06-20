@@ -405,6 +405,104 @@ registerHandler('query.status', async () => {
 // helper is extracted so SSE + polling share the same parallel-batched
 // execution path.
 
+// ─── Result-POST coalescing (fan-out batching UP-leg) ──────────────
+// Default OFF (AGENT_BATCH_RESULT_POSTS=true to enable). When the platform
+// wide-releases a fan-out's agent-file cubes (it does once we advertise
+// `supportsBatchQueries`), N normal-query results complete in close succession.
+// With this ON we coalesce a completion-wave into ONE POST
+// /api/agent/queries/batch-result instead of N posts to /:id/result.
+//
+// Strictly an optimization over the proven per-query path — it never changes a
+// number, only how results are DELIVERED:
+//   • per-id sub-results ({ id, ...resultBody }); the platform resolves each by
+//     id via the SAME resolveAgentQuery as a single post → identical wrong-number
+//     surface, no order-dependence, no cross-resolve.
+//   • a lone result in the window is posted directly to /:id/result (no batch
+//     dependency, byte-identical to today) — batching only kicks in for ≥2.
+//   • if the batch route is unavailable (old platform → 404/405) we fall back to
+//     per-id posts AND stick to per-id for the rest of the session.
+//   • sequence-region results NEVER coalesce (singletons; posted directly).
+//   • a flush snapshots+clears the buffer synchronously before any await, so a
+//     concurrent enqueue can't lose or double-send a result.
+// When OFF, processRelayQuery posts to /:id/result exactly as before (byte-neutral).
+const BATCH_RESULT_POSTS = process.env.AGENT_BATCH_RESULT_POSTS === 'true';
+const BATCH_RESULT_WINDOW_MS = Number(process.env.AGENT_BATCH_RESULT_WINDOW_MS) || 12;
+const BATCH_RESULT_MAX = Number(process.env.AGENT_BATCH_RESULT_MAX) || 12;
+// Bound result-delivery POSTs so a hung WAN connection fails fast (and re-delivers
+// as an error) instead of outliving the 60s inFlightQueryIds prune — which would let
+// a polling pass re-pick-up the same id and redo the work. 15s < the platform's 25s
+// per-cube deadline, so the agent posts an error before the platform gives up. Applies
+// to BOTH the single-post path (default) and the coalesced batch post.
+const RESULT_POST_TIMEOUT_MS = Number(process.env.AGENT_RESULT_POST_TIMEOUT_MS) || 15000;
+
+let _resultBuffer = [];            // [{ id, ...resultBody }] pending delivery
+let _resultFlushTimer = null;
+let _batchConfig = null;           // config captured for the deferred flush
+let _batchEndpointUnavailable = false; // sticky once the batch route 404/405s
+
+async function postSingleResult(id, body, config) {
+  await fetch(`${config.platformUrl}/api/agent/queries/${id}/result`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(RESULT_POST_TIMEOUT_MS),
+  });
+}
+
+async function flushResultBuffer() {
+  // Snapshot + clear BEFORE any await — a concurrent enqueue then targets a fresh
+  // buffer and schedules its own flush; nothing is lost or sent twice.
+  const batch = _resultBuffer;
+  _resultBuffer = [];
+  if (_resultFlushTimer) { clearTimeout(_resultFlushTimer); _resultFlushTimer = null; }
+  const config = _batchConfig;
+  if (!batch.length || !config) return;
+
+  // Lone result → direct post (no batch route dependency; identical to today).
+  if (batch.length === 1) {
+    const { id, ...body } = batch[0];
+    try { await postSingleResult(id, body, config); }
+    catch (e) { console.error(`[Sidecar] result post failed for ${id}:`, e.message); }
+    return;
+  }
+
+  if (!_batchEndpointUnavailable) {
+    try {
+      const res = await fetch(`${config.platformUrl}/api/agent/queries/batch-result`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ results: batch }),
+        signal: AbortSignal.timeout(RESULT_POST_TIMEOUT_MS),
+      });
+      if (res.ok) { console.error(`[Sidecar] batched ${batch.length} relay results in 1 POST`); return; }
+      if (res.status === 404 || res.status === 405) {
+        _batchEndpointUnavailable = true; // old platform — never try the batch route again this session
+        console.error(`[Sidecar] batch-result route unavailable (status=${res.status}); per-id fallback (sticky)`);
+      } else {
+        console.error(`[Sidecar] batch-result POST failed (status=${res.status}); per-id fallback for this batch`);
+      }
+    } catch (e) {
+      console.error(`[Sidecar] batch-result POST threw (${e.message}); per-id fallback for this batch`);
+    }
+  }
+
+  // Fallback: deliver each result individually (old platform or a failed batch POST).
+  // Per-id + independent, so a single failure can't drop a sibling.
+  await Promise.allSettled(batch.map(({ id, ...body }) =>
+    postSingleResult(id, body, config).catch(
+      (e) => console.error(`[Sidecar] fallback result post failed for ${id}:`, e.message))));
+}
+
+function enqueueResult(id, body, config) {
+  _batchConfig = config;
+  _resultBuffer.push({ id, ...body });
+  if (_resultBuffer.length >= BATCH_RESULT_MAX) { flushResultBuffer(); return; } // size cap → flush now
+  if (!_resultFlushTimer) {
+    _resultFlushTimer = setTimeout(flushResultBuffer, BATCH_RESULT_WINDOW_MS);
+    if (_resultFlushTimer.unref) _resultFlushTimer.unref(); // never keep the process alive for a flush
+  }
+}
+
 /**
  * Process a single relay query: read local file, POST result back.
  * Called from both SSE handler (one at a time, no queue) and the
@@ -452,33 +550,44 @@ async function processRelayQuery(query, config) {
       // Forward the FULL envelope (data + pushdown fields aggregationApplied /
       // agentVersion / pushdownContractVersion / _diag) so the platform driver
       // can read them. Stripping to { data } would silently disable pushdown.
-      resultBody = isSequenceRegion ? result : { ...result, data: result.data || [] };
+      //
+      // CAPABILITY HANDSHAKE (fan-out batching, 2026-06-19): advertise
+      // `supportsBatchQueries`. The platform records this per-tenant from the
+      // result payload and, once seen, WIDE-RELEASES a cross-source fan-out's
+      // agent-file cubes all at once instead of throttling to 4 — this sidecar
+      // already fire-and-forgets each relay query concurrently (processRelayQuery
+      // is not awaited; the local query-server's worker pool bounds real
+      // concurrency), so it absorbs the wider influx with no extra logic and its
+      // workers no longer idle waiting for the platform round-trip between tasks.
+      // The UP-leg (coalescing the per-query result POSTs into one batch) is
+      // implemented above as enqueueResult/flushResultBuffer, gated default-OFF.
+      resultBody = isSequenceRegion ? result : { ...result, data: result.data || [], supportsBatchQueries: true };
     } else {
       resultBody = { error: `Local query failed: ${queryRes.status}` };
     }
 
-    await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(resultBody),
-    });
+    // Deliver: coalesce normal-query results into a batch POST when enabled, else
+    // post directly to /:id/result (today's path). Sequence-region never coalesces.
+    if (BATCH_RESULT_POSTS && !isSequenceRegion) {
+      enqueueResult(query.id, resultBody, config);
+    } else {
+      await postSingleResult(query.id, resultBody, config);
+    }
 
     console.error(`[Sidecar] Relay query ${query.id} completed`);
   } catch (queryErr) {
     console.error(`[Sidecar] Relay query ${query.id} failed:`, queryErr.message);
-    try {
-      await fetch(`${config.platformUrl}/api/agent/queries/${query.id}/result`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${config.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ error: queryErr.message }),
-      });
-    } catch { /* ignore */ }
+    // Recompute the sequence-region flag locally (don't depend on a try-scoped const
+    // that may be in TDZ if the throw raced its init) so error delivery never coalesces
+    // a sequence-region result.
+    const isSeqRegion = query.extra?.type === 'sequence-region';
+    if (BATCH_RESULT_POSTS && !isSeqRegion) {
+      enqueueResult(query.id, { error: queryErr.message }, config);
+    } else {
+      try {
+        await postSingleResult(query.id, { error: queryErr.message }, config);
+      } catch { /* ignore */ }
+    }
   }
 }
 
